@@ -1,0 +1,34 @@
+{
+  "name": "ganassurances",
+  "version": "1.0.6",
+  "description": "Konnector Cozy pour récupérer les remboursements santé Gan Assurances",
+  "license": "AGPL-3.0",
+  "repository": {
+    "type": "git",
+    "url": "git@github.com:florian-bellencontre/cozy-konnector-ganassurances.git"
+  },
+  "dependencies": {
+    "@cozy/minilog": "1.0.0",
+    "cozy-clisk": "^0.38.2",
+    "microee": "0.0.6",
+    "p-timeout": "6.1.2"
+  },
+  "eslintConfig": {
+    "extends": [
+      "cozy-app"
+    ]
+  },
+  "eslintIgnore": [
+    "build"
+  ],
+  "scripts": {
+    "lint": "eslint --fix .",
+    "build": "webpack",
+    "watch": "webpack --watch",
+    "deploy": "git-directory-deploy --directory build/ --branch ${DEPLOY_BRANCH:-build} --repo=${DEPLOY_REPOSITORY:-$npm_package_repository_url}",
+    "cozyPublish": "cozy-app-publish --token $REGISTRY_TOKEN --build-commit $(git rev-parse ${DEPLOY_BRANCH:-build})"
+  },
+  "devDependencies": {
+    "cozy-konnector-build": "^1.7.0"
+  }
+}

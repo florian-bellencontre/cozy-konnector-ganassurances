@@ -1,0 +1,8 @@
+{
+  "presets": [
+    ["cozy-app", {
+      "react": false,
+      "lib": true
+    }]
+  ]
+}
