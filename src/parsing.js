@@ -37,133 +37,108 @@ export function summarizeJson(json) {
   }
 }
 
+// Base download URL for a document (a real PDF). The document `identifiant`
+// (a JWT) is appended, plus the `/pdf?print=false` suffix. Confirmed via
+// DevTools: GET /api/ecli/edd/document/{id}/pdf?print=false
+export const DOC_DOWNLOAD_BASE =
+  'https://espaceclient.ganassurances.fr/api/ecli/edd/document/'
+
 /**
- * Turn the "page-remboursements" API payload into a normalized list.
+ * Parse the "espace-documentaire" API payload into a normalized list of
+ * downloadable documents (real PDFs).
  *
- * Real Gan shape (GET /api/ecli/bff/v1/remboursement/page-remboursements/{id}):
- *   { blocRemboursements: { remboursementsParMois: [
- *       { mois, annee, remboursements: [
- *           { dateVersement, montant: "5,40 €", partieAyantRecu,
- *             beneficiaire, libelleRemboursementPar, action: { url } } ] } ] } }
+ * Real Gan shape (GET /api/ecli/bff/espace-documentaire):
+ *   { hubs: [ { code:'H_SANTE', contrats: [ { identifiant, documents: [
+ *       { identifiant:<JWT>, libelle, codeType:'RELEVE_DE_PRESTATIONS_SANTE',
+ *         datePublication } ] } ] } ],
+ *     attestationsTiersPayant: { contrats: [ { documents: [ { identifiant,
+ *       naturePiece:'ATPG', libelle, codeType, datePublication } ] } ] } }
  *
- * Also tolerates the `remboursementsRecents` array from sante-prevoyance/full.
- *
- * Normalized item: { id, date, amount, label, currency, fileurl? }
+ * Normalized item: { id, date, label, codeType, fileurl }
  *
  * @param {*} data - the API JSON body (or null)
+ * @param {object} [opts]
+ * @param {boolean} [opts.attestations] - also include tiers-payant attestations
  * @param {object} [logger]
  * @returns {Array<object>}
  */
-export function parseReimbursements(data, logger) {
-  if (!data) return []
+export function parseDocuments(data, opts = {}, logger) {
+  if (!data || typeof data !== 'object') return []
 
-  let list = []
-  const bloc = data.blocRemboursements
-  if (bloc && Array.isArray(bloc.remboursementsParMois)) {
-    // Flatten month groups into a single list.
-    list = bloc.remboursementsParMois.flatMap(m =>
-      Array.isArray(m.remboursements) ? m.remboursements : []
-    )
-  } else if (Array.isArray(data.remboursementsRecents)) {
-    list = data.remboursementsRecents
-  } else if (Array.isArray(data)) {
-    list = data
-  } else if (Array.isArray(data.remboursements)) {
-    list = data.remboursements
+  const raw = []
+  // Health hub documents (relevés de prestations santé).
+  for (const hub of data.hubs || []) {
+    for (const contrat of hub.contrats || []) {
+      for (const doc of contrat.documents || []) raw.push(doc)
+    }
+  }
+  // Optionally the tiers-payant attestations (mutuelle card).
+  if (opts.attestations && data.attestationsTiersPayant) {
+    for (const contrat of data.attestationsTiersPayant.contrats || []) {
+      for (const doc of contrat.documents || []) raw.push(doc)
+    }
   }
 
-  if (!Array.isArray(list) || !list.length) {
-    if (logger)
-      logger.info('parseReimbursements: no reimbursement found in payload')
-    return []
-  }
-
-  return list
-    .map(raw => normalizeReimbursement(raw))
-    .filter(r => r && r.date && Number.isFinite(r.amount))
+  const docs = raw.map(normalizeDocument).filter(Boolean)
+  if (logger) logger.info(`parseDocuments: ${docs.length} document(s)`)
+  return docs
 }
 
 /**
- * Map one raw Gan reimbursement to the normalized shape.
- *
+ * Map one raw Gan document to the normalized shape.
  * @param {object} raw
  * @returns {object|null}
  */
-function normalizeReimbursement(raw) {
-  if (!raw || typeof raw !== 'object') return null
-
-  // Date: page-remboursements uses `dateVersement`; the recent list uses
-  // `dateDuVersement`. Prefer the payment date (matches the bank operation).
-  const rawDate = raw.dateVersement || raw.dateDuVersement || raw.date
-  // Amount: page-remboursements uses a FR string "5,40 €"; the recent list uses
-  // a number `montantDuVersement`.
-  const rawAmount = raw.montant != null ? raw.montant : raw.montantDuVersement
-
-  const date = parseFrDate(rawDate)
-  const amount = parseAmount(rawAmount)
-
-  // The action url embeds a stable reimbursement id:
-  // /remboursements/{contrat}/remboursement/{id}
-  const actionUrl = raw.action && raw.action.url ? String(raw.action.url) : ''
-  const idMatch = actionUrl.match(/remboursement\/([^/?]+)/)
-  const id =
-    (idMatch && idMatch[1]) ||
-    (date ? `${date.toISOString().slice(0, 10)}-${amount}` : undefined)
-
-  // Payee (lab, doctor, pharmacy…) makes the most useful label.
-  const payee = raw.partieAyantRecu || raw.destinataireDuPaiement || ''
-  const label = payee ? `Remboursement santé — ${payee}` : 'Remboursement santé'
-
+function normalizeDocument(raw) {
+  if (!raw || typeof raw !== 'object' || !raw.identifiant) return null
+  const id = String(raw.identifiant)
+  const date = parseFrDate(raw.datePublication) || null
+  const codeType = raw.codeType || 'DOCUMENT'
+  const label =
+    raw.libelle ||
+    (codeType === 'RELEVE_DE_PRESTATIONS_SANTE'
+      ? 'Relevé de prestations santé'
+      : 'Document Gan')
   return {
-    id: id != null ? String(id) : undefined,
+    id,
     date,
-    amount,
     label,
-    currency: '€',
-    // Gan exposes a detail page, not a per-reimbursement PDF; leave fileurl
-    // undefined so a bill is still saved (linked to the bank operation).
-    fileurl: undefined
+    codeType,
+    fileurl: DOC_DOWNLOAD_BASE + encodeURIComponent(id) + '/pdf?print=false'
   }
 }
 
 /**
- * Build Cozy bill objects from normalized reimbursements.
+ * Build Cozy bill objects from normalized documents (real PDFs).
  *
- * A reimbursement is money the insurer pays back to the user, so `isRefund` is
- * true. When the API exposes a document URL, it is downloaded (with the OIDC
- * bearer token if any); otherwise the bill is saved without a file.
+ * Reimbursement statements are money paid back, so `isRefund` is true. The PDF
+ * is downloaded from `fileurl`; a short stable id per document keeps dedup safe.
  *
- * @param {Array<object>} reimbursements
- * @param {object} [opts]
- * @param {string} [opts.token] - Authorization header value for downloads
+ * @param {Array<object>} documents
  * @returns {Array<object>}
  */
-export function buildBills(reimbursements) {
-  return reimbursements.map(r => {
-    const dateStr = r.date.toISOString().slice(0, 10)
-    const amountStr = Math.abs(r.amount).toFixed(2).replace('.', ',')
-
-    // Gan does not expose a per-reimbursement PDF, and saveBills always needs a
-    // file, so we attach a small text receipt (as a base64 data URI) that
-    // saveFiles turns into a real document in the Drive.
-    const receipt = buildReceiptText(r)
-    const dataUri = 'data:text/plain;base64,' + base64EncodeUtf8(receipt)
-
+export function buildBills(documents) {
+  return documents.map((d, index) => {
+    const date = d.date || new Date()
+    const dateStr = date.toISOString().slice(0, 10)
+    // A short, stable ref: the document JWT is long, so hash-ish it by index+date.
+    const vendorRef = `${dateStr}-${shortHash(d.id)}`
     return {
       vendor: VENDOR,
-      vendorRef: r.id || `${dateStr}-${r.amount}`,
-      date: r.date,
-      amount: Math.abs(r.amount),
+      vendorRef,
+      date,
       isRefund: true,
-      currency: r.currency || '€',
-      filename: `${dateStr}_gan_remboursement_${amountStr}EUR.txt`,
-      dataUri,
+      currency: '€',
+      filename: `${dateStr}_gan_releve_prestations${
+        documents.length > 1 ? '_' + (index + 1) : ''
+      }.pdf`,
+      fileurl: d.fileurl,
       fileAttributes: {
         metadata: {
           contentAuthor: 'ganassurances',
-          datetime: r.date,
+          datetime: date,
           datetimeLabel: 'issueDate',
-          issueDate: r.date,
+          issueDate: date,
           carbonCopy: true
         }
       }
@@ -172,38 +147,18 @@ export function buildBills(reimbursements) {
 }
 
 /**
- * Human-readable receipt text for one reimbursement.
- * @param {object} r - normalized reimbursement
- * @returns {string}
- */
-export function buildReceiptText(r) {
-  const dateStr = r.date.toISOString().slice(0, 10)
-  const amountStr = Math.abs(r.amount).toFixed(2).replace('.', ',')
-  return [
-    'Remboursement santé — Gan Assurances',
-    '',
-    `Date du versement : ${dateStr}`,
-    `Montant remboursé : ${amountStr} €`,
-    `Libellé : ${r.label}`,
-    r.id ? `Référence : ${r.id}` : null
-  ]
-    .filter(Boolean)
-    .join('\n')
-}
-
-/**
- * Base64-encode a UTF-8 string (works in the pilot/browser context).
+ * Small stable hash of a string → short hex, to build a compact bill ref from
+ * the long JWT document id.
  * @param {string} str
  * @returns {string}
  */
-export function base64EncodeUtf8(str) {
-  // Encode UTF-8 safely before btoa (which is latin1-only).
-  const utf8 = encodeURIComponent(str).replace(/%([0-9A-F]{2})/g, (_, h) =>
-    String.fromCharCode(parseInt(h, 16))
-  )
-  if (typeof btoa === 'function') return btoa(utf8)
-  // Node fallback (tests)
-  return Buffer.from(utf8, 'binary').toString('base64')
+export function shortHash(str) {
+  let h = 0
+  const s = String(str)
+  for (let i = 0; i < s.length; i++) {
+    h = (h * 31 + s.charCodeAt(i)) | 0
+  }
+  return (h >>> 0).toString(16)
 }
 
 /**
@@ -249,13 +204,18 @@ export function parseFrDate(value) {
   if (value instanceof Date) return isNaN(value) ? null : value
   const str = String(value).trim()
 
-  // ISO (YYYY-MM-DD...) — accepted as-is.
-  if (/^\d{4}-\d{2}-\d{2}/.test(str)) {
-    const d = new Date(str)
+  // ISO (YYYY-MM-DD, optionally with a time). Build from the date parts in UTC
+  // so the calendar day is preserved: `new Date('2026-07-16T00:00:00')` (no
+  // timezone) is parsed as LOCAL time and toISOString() would shift it a day
+  // west of UTC.
+  const iso = str.match(/^(\d{4})-(\d{2})-(\d{2})/)
+  if (iso) {
+    const d = new Date(
+      Date.UTC(Number(iso[1]), Number(iso[2]) - 1, Number(iso[3]))
+    )
     return isNaN(d) ? null : d
   }
-  // French DD/MM/YYYY — build in UTC so the calendar day is preserved regardless
-  // of the machine timezone (a local-time Date would shift a day west of UTC).
+  // French DD/MM/YYYY — build in UTC too.
   const m = str.match(/^(\d{2})\/(\d{2})\/(\d{4})$/)
   if (m) {
     const d = new Date(Date.UTC(Number(m[3]), Number(m[2]) - 1, Number(m[1])))

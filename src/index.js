@@ -2,7 +2,7 @@ import { ContentScript } from 'cozy-clisk/dist/contentscript'
 import Minilog from '@cozy/minilog'
 import pTimeout from 'p-timeout'
 import RequestInterceptor from './interceptor'
-import { parseReimbursements, buildBills, summarizeJson } from './parsing'
+import { parseDocuments, buildBills, summarizeJson } from './parsing'
 
 const log = Minilog('ContentScript')
 Minilog.enable()
@@ -11,15 +11,17 @@ Minilog.enable()
 const BASE_URL = 'https://espaceclient.ganassurances.fr'
 const AUTH_HOST = 'authentification.ganassurances.fr'
 const HUB_SANTE_URL = `${BASE_URL}/front/hub/sante-prevoyance`
+// Documents area, filtered on the health reimbursement statements (real PDFs).
+const DOCS_URL = `${BASE_URL}/front/mes-documents?filter=RELEVE_DE_PRESTATIONS_SANTE`
 
 // Set to true only to re-map the API (logs every JSON endpoint + shapes) when
 // Gan changes its site. Normal operation is false.
 const DISCOVERY_MODE = false
 
 // Endpoints we intercept (JSON bodies). Confirmed by recon:
-// - sante-prevoyance/full → contract id + `remboursementsRecents` (3 latest)
-// - page-remboursements/{contract} → `blocRemboursements.remboursementsParMois`
-//   (full history, ~15 latest per page)
+// - sante-prevoyance/full → contract id (contratsSante[0].identifiant)
+// - espace-documentaire → list of downloadable documents (relevés PDF), each
+//   with a JWT `identifiant` used to build the /api/ecli/edd/document/{id}/pdf URL
 const INTERCEPTIONS = [
   {
     label: 'sante-full',
@@ -28,9 +30,9 @@ const INTERCEPTIONS = [
     serialization: 'json'
   },
   {
-    label: 'page-remboursements',
+    label: 'espace-documentaire',
     method: 'GET',
-    url: '/api/ecli/bff/v1/remboursement/page-remboursements/',
+    url: '/api/ecli/bff/espace-documentaire',
     serialization: 'json'
   }
 ]
@@ -352,56 +354,34 @@ class GanContentScript extends ContentScript {
       return
     }
 
-    // 1. Open the santé hub → triggers sante-prevoyance/full (contract id + recents).
-    const [full] = await Promise.all([
-      this.waitForInterceptionSafe('sante-full', { timeout: 45000 }),
+    // Open the documents area (filtered on health statements). The SPA fires the
+    // espace-documentaire XHR, which we intercept to get the list of downloadable
+    // PDFs (each with a JWT id used to build its /api/ecli/edd/... download url).
+    const [docPayload] = await Promise.all([
+      this.waitForInterceptionSafe('espace-documentaire', { timeout: 45000 }),
       (async () => {
-        await this.goto(HUB_SANTE_URL)
+        await this.goto(DOCS_URL)
         await this.waitForElementInWorker('body', {})
       })()
     ])
 
-    const contractId =
-      this.getSanteContractId() ||
-      (full && full.response && full.response.contratsSante?.[0]?.identifiant)
+    const documents = parseDocuments(
+      docPayload && docPayload.response,
+      { attestations: false },
+      log
+    )
+    this.log('info', `Found ${documents.length} document(s) to save`)
 
-    // 2. Get the full reimbursement history. The SPA fires the
-    // page-remboursements XHR when the user opens "Voir tous mes
-    // remboursements"; navigating to the raw API url would NOT trigger it. So
-    // we click that link in the worker and wait for the interception. If it
-    // doesn't come, we fall back to the recent list (already in `full`).
-    let historyData = null
-    if (contractId) {
-      const [page] = await Promise.all([
-        this.waitForInterceptionSafe('page-remboursements', { timeout: 20000 }),
-        this.runInWorker('clickAllReimbursements').catch(() => false)
-      ])
-      historyData = page && page.response
-      if (!historyData) {
-        this.log('info', 'Full history not captured, using recent list')
-      }
-    } else {
-      this.log(
-        'warn',
-        'No santé contract id found; falling back to recent list'
-      )
-    }
-
-    // Prefer the full history; fall back to the recent list from the hub.
-    const source = historyData || (full && full.response) || null
-    const reimbursements = parseReimbursements(source, log)
-    this.log('info', `Parsed ${reimbursements.length} reimbursement(s)`)
-
-    const bills = buildBills(reimbursements)
+    const bills = buildBills(documents)
     if (bills.length) {
       await this.saveBills(bills, {
         context,
         fileIdAttributes: ['vendorRef'],
-        contentType: 'text/plain',
+        contentType: 'application/pdf',
         qualificationLabel: 'health_invoice'
       })
     } else {
-      this.log('info', 'No reimbursement to save')
+      this.log('info', 'No document to save')
     }
   }
 
@@ -513,37 +493,6 @@ class GanContentScript extends ContentScript {
     return out.slice(0, 80)
   }
 
-  /**
-   * Worker method: click the "Voir tous mes remboursements" link/button in the
-   * santé hub (shadow-DOM aware) to trigger the page-remboursements API call.
-   * @returns {boolean} true if a control was clicked
-   */
-  async clickAllReimbursements() {
-    const matches = el => {
-      const t = (el.innerText || el.textContent || '').trim().toLowerCase()
-      return (
-        (t.includes('rembours') &&
-          (t.includes('tous') || t.includes('voir') || t.includes('mes'))) ||
-        t === 'remboursements'
-      )
-    }
-    const walk = root => {
-      for (const el of root.querySelectorAll(
-        'a, button, [role="link"], [role="button"], [role="tab"]'
-      )) {
-        if (matches(el)) {
-          el.click()
-          return true
-        }
-      }
-      for (const el of root.querySelectorAll('*')) {
-        if (el.shadowRoot && walk(el.shadowRoot)) return true
-      }
-      return false
-    }
-    return walk(document)
-  }
-
   // -----------------------------------------------------------------------
   // Helpers
   // -----------------------------------------------------------------------
@@ -593,8 +542,7 @@ connector
     additionalExposedMethodsNames: [
       'checkWafRejected',
       'fillLoginForm',
-      'scanNavigation',
-      'clickAllReimbursements'
+      'scanNavigation'
     ]
   })
   .catch(err => {
