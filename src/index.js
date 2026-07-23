@@ -9,17 +9,8 @@ Minilog.enable()
 
 // --- Site constants -------------------------------------------------------
 const BASE_URL = 'https://espaceclient.ganassurances.fr'
-const LOGIN_URL = 'https://www.espaceclient.gan.fr'
 const AUTH_HOST = 'authentification.ganassurances.fr'
 const HUB_SANTE_URL = `${BASE_URL}/front/hub/sante-prevoyance`
-
-// Marker of the F5 WAF challenge page. If the WAF blocks the request, the page
-// body contains this text; we then let the user retry in a visible webview.
-const WAF_REJECTED_TEXT = 'The requested URL was rejected'
-
-// DOM marker of the Keycloak login form. The real inputs live inside `gdt-*`
-// web components shadow DOM; worker-side methods look them up shadow-aware.
-const USERNAME_SELECTOR = '#username'
 
 // Set to true only to re-map the API (logs every JSON endpoint + shapes) when
 // Gan changes its site. Normal operation is false.
@@ -121,25 +112,38 @@ class GanContentScript extends ContentScript {
     this.log('info', '🤖 ensureAuthenticated')
     this.bridge.addEventListener('workerEvent', this.onWorkerEvent.bind(this))
 
+    // On a fresh connection (no account yet), make sure we start logged out so
+    // the user goes through the login + SMS explicitly.
     if (!account) {
       await this.ensureNotAuthenticated()
     }
 
-    await this.navigateToLoginForm()
+    // Go to the espace client. If the session is still valid (trusted device),
+    // we land on the dashboard; otherwise we are redirected to the Keycloak
+    // login. Let the page settle, then decide — no rigid waits that could time
+    // out on the already-authenticated path.
+    await this.goto(BASE_URL)
+    await this.waitForDomReadySafe()
 
-    const authenticated = await this.runInWorker('checkAuthenticated')
-    if (authenticated) {
+    if (await this.runInWorker('checkWafRejected')) {
+      this.log('warn', 'WAF challenge detected, asking user to retry')
+      await this.showLoginFormAndWaitForAuthentication()
+      this.unblockWorkerInteractions()
+      return true
+    }
+
+    if (await this.runInWorker('checkAuthenticated')) {
       this.log('info', 'Already authenticated')
       this.unblockWorkerInteractions()
       return true
     }
 
-    // Optionally pre-fill known credentials, but never auto-submit: the WAF and
-    // the SMS 2FA make a fully automated login unreliable, so the user finishes
-    // the login (and the SMS code) themselves in the visible webview.
+    // Not authenticated: pre-fill known credentials if any (never auto-submit —
+    // the WAF and SMS 2FA make full automation unreliable), then let the user
+    // finish the login and the SMS code themselves in the visible webview.
     const credentials = await this.getCredentials()
     if (credentials?.login) {
-      await this.autoFill(credentials)
+      await this.autoFill(credentials).catch(() => {})
     }
 
     await this.showLoginFormAndWaitForAuthentication()
@@ -149,32 +153,24 @@ class GanContentScript extends ContentScript {
 
   async ensureNotAuthenticated() {
     this.log('info', '🤖 ensureNotAuthenticated')
-    await this.navigateToLoginForm()
-    const authenticated = await this.runInWorker('checkAuthenticated')
-    if (!authenticated) return true
-    // Trigger Keycloak logout, then wait for the login form to come back.
     await this.goto(
       `https://${AUTH_HOST}/auth/realms/gan-assurances/protocol/openid-connect/logout`
     )
-    await this.waitForElementInWorker(USERNAME_SELECTOR)
+    await this.waitForDomReadySafe()
     return true
   }
 
-  async navigateToLoginForm() {
-    this.log('info', '🤖 navigateToLoginForm')
-    await this.goto(LOGIN_URL)
-    // Wait for either the login form (username field) or the WAF challenge.
-    await Promise.race([
-      this.waitForElementInWorker(USERNAME_SELECTOR),
-      this.waitForElementInWorker('body', { includesText: WAF_REJECTED_TEXT }),
-      // Already-authenticated case: the espace client dashboard.
-      this.waitForElementInWorker('[data-testid], main, #root', {})
-    ])
-
-    if (await this.runInWorker('checkWafRejected')) {
-      this.log('warn', 'WAF challenge detected, asking user to retry')
-      await this.showLoginFormAndWaitForAuthentication()
+  /**
+   * Wait for the page DOM to be ready without ever throwing on timeout, so the
+   * auth flow keeps going whatever the landing page (login, dashboard, WAF).
+   */
+  async waitForDomReadySafe() {
+    try {
+      await this.waitForElementInWorker('body', {})
+    } catch (err) {
+      this.log('info', `waitForDomReadySafe: ${err.message}`)
     }
+    await this.wait(3000)
   }
 
   /**
