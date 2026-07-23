@@ -7,8 +7,6 @@
  * where you adapt the field mapping once the payload is known.
  */
 
-const VENDOR = 'Gan Assurances'
-
 /**
  * Log-friendly summary of an intercepted JSON body: its top-level keys and, for
  * arrays, the keys of the first item. Used in discovery mode to identify the
@@ -109,26 +107,23 @@ function normalizeDocument(raw) {
 }
 
 /**
- * Build Cozy bill objects from normalized documents (real PDFs).
+ * Build Cozy file entries from normalized documents (real PDFs).
  *
- * Reimbursement statements are money paid back, so `isRefund` is true. The PDF
- * is downloaded from `fileurl`; a short stable id per document keeps dedup safe.
+ * These are statements (documents), not invoices with an amount, so they are
+ * meant for saveFiles (not saveBills). The PDF is downloaded from `fileurl`;
+ * `vendorRef` gives a short stable id per document for dedup.
  *
  * @param {Array<object>} documents
  * @returns {Array<object>}
  */
-export function buildBills(documents) {
+export function buildFiles(documents) {
   return documents.map((d, index) => {
     const date = d.date || new Date()
     const dateStr = date.toISOString().slice(0, 10)
-    // A short, stable ref: the document JWT is long, so hash-ish it by index+date.
+    // A short, stable ref: the document JWT is long, so hash it by content.
     const vendorRef = `${dateStr}-${shortHash(d.id)}`
     return {
-      vendor: VENDOR,
       vendorRef,
-      date,
-      isRefund: true,
-      currency: '€',
       filename: `${dateStr}_gan_releve_prestations${
         documents.length > 1 ? '_' + (index + 1) : ''
       }.pdf`,

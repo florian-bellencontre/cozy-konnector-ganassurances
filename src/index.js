@@ -2,7 +2,7 @@ import { ContentScript } from 'cozy-clisk/dist/contentscript'
 import Minilog from '@cozy/minilog'
 import pTimeout from 'p-timeout'
 import RequestInterceptor from './interceptor'
-import { parseDocuments, buildBills, summarizeJson } from './parsing'
+import { parseDocuments, buildFiles, summarizeJson } from './parsing'
 
 const log = Minilog('ContentScript')
 Minilog.enable()
@@ -372,9 +372,11 @@ class GanContentScript extends ContentScript {
     )
     this.log('info', `Found ${documents.length} document(s) to save`)
 
-    const bills = buildBills(documents)
-    if (bills.length) {
-      await this.saveBills(bills, {
+    const files = buildFiles(documents)
+    if (files.length) {
+      // These are documents (PDF statements), not invoices with an amount, so
+      // saveFiles (not saveBills, which requires `amount`) is the right call.
+      await this.saveFiles(files, {
         context,
         fileIdAttributes: ['vendorRef'],
         contentType: 'application/pdf',

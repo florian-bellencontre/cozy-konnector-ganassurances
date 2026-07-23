@@ -1,6 +1,6 @@
 {
   "name": "ganassurances",
-  "version": "1.0.8",
+  "version": "1.0.9",
   "description": "Konnector Cozy pour récupérer les remboursements santé Gan Assurances",
   "license": "AGPL-3.0",
   "repository": {

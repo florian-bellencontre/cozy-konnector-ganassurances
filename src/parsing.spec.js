@@ -1,6 +1,6 @@
 import {
   parseDocuments,
-  buildBills,
+  buildFiles,
   buildIdentity,
   summarizeJson,
   parseAmount,
@@ -86,7 +86,7 @@ describe('parseDocuments (espace-documentaire)', () => {
   })
 })
 
-describe('buildBills (real PDFs)', () => {
+describe('buildFiles (real PDFs)', () => {
   const docs = parseDocuments(
     {
       hubs: [
@@ -108,13 +108,12 @@ describe('buildBills (real PDFs)', () => {
     },
     { attestations: false }
   )
-  it('builds a refund bill downloading the PDF', () => {
-    const [bill] = buildBills(docs)
-    expect(bill.isRefund).toBe(true)
-    expect(bill.vendor).toBe('Gan Assurances')
-    expect(bill.filename).toMatch(/^2026-07-16_gan_releve_prestations.*\.pdf$/)
-    expect(bill.fileurl).toBe(DOC_DOWNLOAD_BASE + 'JWT_AAA/pdf?print=false')
-    expect(bill.fileAttributes.metadata.carbonCopy).toBe(true)
+  it('builds a file entry downloading the PDF', () => {
+    const [file] = buildFiles(docs)
+    expect(file.filename).toMatch(/^2026-07-16_gan_releve_prestations.*\.pdf$/)
+    expect(file.fileurl).toBe(DOC_DOWNLOAD_BASE + 'JWT_AAA/pdf?print=false')
+    expect(file.vendorRef).toMatch(/^2026-07-16-/)
+    expect(file.fileAttributes.metadata.carbonCopy).toBe(true)
   })
 })
 
