@@ -1,0 +1,80 @@
+{
+  "version": "1.0.9",
+  "name": "Gan Assurances",
+  "type": "konnector",
+  "language": "node",
+  "clientSide": true,
+  "icon": "icon.svg",
+  "slug": "ganassurances",
+  "source": "git@github.com:florian-bellencontre/cozy-konnector-ganassurances.git",
+  "editor": "Cozy",
+  "vendor_link": "https://espaceclient.ganassurances.fr",
+  "categories": [
+    "insurance"
+  ],
+  "fields": {},
+  "folders": [
+    {
+      "defaultDir": "$administrative/$konnector/$account"
+    }
+  ],
+  "time_interval": [
+    0,
+    24
+  ],
+  "data_types": [
+    "bill"
+  ],
+  "permissions": {
+    "carbon_copy": {
+      "type": "io.cozy.certified.carbon_copy"
+    },
+    "bills": {
+      "type": "io.cozy.bills"
+    },
+    "files": {
+      "type": "io.cozy.files"
+    },
+    "identities": {
+      "type": "io.cozy.identities"
+    }
+  },
+  "developer": {
+    "name": "Cozy",
+    "url": ""
+  },
+  "langs": [
+    "fr"
+  ],
+  "locales": {
+    "fr": {
+      "short_description": "Récupère vos remboursements santé Gan Assurances",
+      "long_description": "Gan Assurances est un assureur français accessible sur [espaceclient.ganassurances.fr](https://espaceclient.ganassurances.fr).\n\n**Connectez votre compte Gan à votre Cozy pour récupérer**\n\n- vos décomptes de remboursement santé\n\n**Accédez directement à vos documents dans votre Drive personnel**\n\nEn connectant votre compte Gan, votre Cozy crée automatiquement un dossier dans **Drive > Administratif > Gan Assurances**. Vos décomptes sont à portée de main et toujours accessibles.\n\n**Suivez vos remboursements avec Banks**\n\nLes remboursements récupérés sont automatiquement liés aux opérations bancaires Gan associées à votre compte si vous utilisez l'application Banks.\n\n**Configuration**\n\nLa connexion se fait directement sur le site sécurisé de Gan Assurances : renseignez votre identifiant et votre mot de passe, puis validez le code de confirmation reçu par SMS. Cochez « Se fier à cet appareil » pour éviter de ressaisir le code aux prochaines synchronisations.",
+      "permissions": {
+        "carbon_copy": {
+          "description": "Utilisé pour certifier que vos fichiers sont copie conforme des documents d'origine"
+        },
+        "bills": {
+          "description": "Utilisé pour sauver les données de vos remboursements"
+        },
+        "files": {
+          "description": "Utilisé pour sauvegarder vos décomptes de remboursement"
+        },
+        "identities": {
+          "description": "Utilisé pour sauvegarder votre identité"
+        }
+      }
+    }
+  },
+  "qualification_labels": [
+    "health_invoice"
+  ],
+  "features": [
+    "METADATA_DEDUP",
+    "DOC_QUALIFICATION_V2",
+    "HEALTH",
+    "CARBON_COPY"
+  ],
+  "banksTransactionRegExp": "\\bgan\\b",
+  "manifest_version": "2"
+}
