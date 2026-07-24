@@ -131,11 +131,14 @@ class GanContentScript extends ContentScript {
       return true
     }
 
+    // Decide the session from the API itself, not from a snapshot of the URL:
+    // right after landing, Gan may briefly bounce through the SSO host to
+    // refresh the token even when the session is valid. Poll the santé endpoint
+    // a few times — a 200 with JSON means we are authenticated for good.
     if (await this.runInWorker('checkAuthenticated')) {
       this.log('info', 'Already authenticated')
-      // No user input needed on this path: make sure the webview stays hidden so
-      // a manual sync runs silently in the background (like directenergie), and
-      // does not leave the Gan dashboard open in the app.
+      // No user input needed on this path: keep the webview hidden so a manual
+      // sync runs silently in the background (like directenergie).
       await this.setWorkerState({ visible: false })
       this.unblockWorkerInteractions()
       return true
@@ -292,24 +295,44 @@ class GanContentScript extends ContentScript {
   }
 
   /**
-   * Authenticated when we are on the espace client (not on the auth host and
-   * not on the SMS 2FA step). Returning false keeps the visible webview open so
-   * the user can enter the SMS code.
+   * Runs in the worker. Authenticated iff an authenticated same-origin API call
+   * succeeds. This is far more reliable than inspecting the URL: right after
+   * landing, Gan may briefly bounce through the SSO host to refresh the token
+   * even when the session is valid — a URL snapshot would wrongly read "logged
+   * out". We poll the santé endpoint a few times to let any redirect settle.
+   *
+   * Returning false keeps the visible webview open so the user can log in / do
+   * the SMS 2FA.
    */
   async checkAuthenticated() {
+    // If we are visibly parked on the identity provider's SMS/login step, we are
+    // clearly not done — no need to probe the API.
     const href = document.location.href
-    // Still on the identity provider → not done (login or SMS step).
     if (href.includes('authentification.ganassurances.fr')) {
-      const txt = document.body?.innerText || ''
-      if (/code de confirmation|vérification de votre identité/i.test(txt)) {
-        // 2FA SMS step — wait for the user.
-        return false
-      }
       return false
     }
-    // On the espace client domain and past the OAuth redirect.
-    if (href.includes('espaceclient.ganassurances.fr')) {
-      return !href.includes('/login/oauth2/')
+
+    const probe = async () => {
+      try {
+        const res = await window.fetch(
+          `${document.location.origin}/api/ecli/bff/hubs/sante-prevoyance/full`,
+          {
+            method: 'GET',
+            credentials: 'include',
+            headers: { Accept: 'application/json' }
+          }
+        )
+        if (!res.ok) return false
+        const json = await res.json()
+        return !!(json && typeof json === 'object')
+      } catch (err) {
+        return false
+      }
+    }
+
+    for (let i = 0; i < 5; i++) {
+      if (await probe()) return true
+      await new Promise(resolve => setTimeout(resolve, 1500))
     }
     return false
   }
