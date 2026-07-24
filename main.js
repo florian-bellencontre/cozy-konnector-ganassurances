@@ -6667,27 +6667,43 @@ class GanContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED_M
    * @returns {Promise<boolean>}
    */
   async waitForAuthOrLogin() {
-    // Poll for ~35s, deciding on whichever reliable signal appears first:
-    //   authenticated  → a Bearer-authenticated API call was seen, OR the santé
-    //                    payload was intercepted (both prove an active session);
-    //   logged out     → the Keycloak login field (#username) is present.
-    // The login page never issues a Bearer API call, so these never collide.
-    const deadline = 35000
-    const step = 1000
+    // Poll for ~30s. The decision is made by an actual authenticated API call
+    // from inside the page (apiGet uses the page's own session cookies), which
+    // is the same call fetch() relies on and is proven to work when logged in:
+    //   - apiGet returns JSON        → session active  → authenticated;
+    //   - the #username field shows  → logged out;
+    // We also accept the passive signals (a Bearer API call seen, or the santé
+    // payload intercepted) as a fast path. This never hangs on the dashboard.
+    const deadline = 30000
+    const step = 1500
     for (let waited = 0; waited < deadline; waited += step) {
+      // Fast path: passive signals already prove an active session.
       if (
         this.store?.seenAuthenticatedApiCall ||
         this.store?.interceptions?.['sante-full']
       ) {
         return true
       }
+      // Active probe: ask the page to call an authenticated API with its own
+      // session. We use espace-documentaire because we already know it answers
+      // JSON when logged in (fetch() collects the 30 PDFs from it), and cache it
+      // so fetch() can reuse it without a second call.
+      const docs = await this.runInWorker(
+        'apiGet',
+        '/api/ecli/bff/espace-documentaire'
+      )
+      if (docs && typeof docs === 'object') {
+        this.store = this.store || {}
+        this.store.espaceDocumentaire = docs
+        return true
+      }
+      // Otherwise, if the login field is present we are logged out.
       if (await this.runInWorker('waitForLoginField')) {
         return false
       }
       await this.wait(step)
     }
-    // Timed out with no clear signal: fall back to the DOM check (login field
-    // absent on the espace client domain → treat as authenticated).
+    // Timed out: last-resort DOM check.
     return await this.runInWorker('checkAuthenticated')
   }
 
@@ -6861,20 +6877,21 @@ class GanContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED_M
   // -----------------------------------------------------------------------
   async getUserDataFromWebsite() {
     this.log('info', '🤖 getUserDataFromWebsite')
-    // The stable identifier is the santé contract number. Fetch the API
-    // directly (no visible navigation): the user is already authenticated, so
-    // the santé hub endpoint answers with the contract in `contratsSante[0]`.
-    let contractId = this.getSanteContractId()
+    // Stable identifier = the santé contract number. Try, in order and without
+    // any visible navigation: the santé payload we may already hold, the
+    // contract id embedded in the documents payload fetched during auth, a
+    // direct santé API call, then the submitted login as a last resort.
+    let contractId = this.getSanteContractId() || this.contractIdFromDocs()
     if (!contractId) {
       const full = await this.runInWorker(
         'apiGet',
         '/api/ecli/bff/hubs/sante-prevoyance/full'
       )
-      contractId =
-        (Array.isArray(full?.contratsSante) &&
-          full.contratsSante[0]?.identifiant &&
-          String(full.contratsSante[0].identifiant)) ||
-        null
+      if (full && typeof full === 'object') {
+        this.store = this.store || {}
+        this.store.santeFull = full
+        contractId = this.getSanteContractId()
+      }
     }
     const sourceAccountIdentifier =
       contractId || this.store?.userCredentials?.login
@@ -6884,6 +6901,15 @@ class GanContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED_M
       )
     }
     return { sourceAccountIdentifier }
+  }
+
+  /** Contract id read from the documents payload (hubs[].contrats[].identifiant). */
+  contractIdFromDocs() {
+    const docs = this.store?.espaceDocumentaire
+    const hub = docs && Array.isArray(docs.hubs) && docs.hubs[0]
+    const contrat = hub && Array.isArray(hub.contrats) && hub.contrats[0]
+    const id = contrat && contrat.identifiant
+    return id ? String(id) : null
   }
 
   /**
@@ -6897,7 +6923,10 @@ class GanContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED_M
 
   /** @returns {string|null} the santé contract id, or null */
   getSanteContractId() {
-    const full = this.store?.interceptions?.['sante-full']?.response
+    // Prefer the payload fetched during auth (store.santeFull), fall back to the
+    // intercepted one if the SPA happened to call it on its own.
+    const full =
+      this.store?.santeFull || this.store?.interceptions?.['sante-full']?.response
     const c =
       full &&
       Array.isArray(full.contratsSante) &&
@@ -6925,12 +6954,13 @@ class GanContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED_M
     }
 
     // Fetch the documents list directly from the API (no visible navigation to
-    // the documents page). We are authenticated, so the endpoint returns the
-    // relevés with their JWT ids used to build each /api/ecli/edd/... PDF url.
-    const docPayload = await this.runInWorker(
-      'apiGet',
-      '/api/ecli/bff/espace-documentaire'
-    )
+    // the documents page). Reuse the payload already fetched during the auth
+    // probe when available, else call the endpoint now. We are authenticated,
+    // so it returns the relevés with their JWT ids used to build each
+    // /api/ecli/edd/... PDF url.
+    const docPayload =
+      this.store?.espaceDocumentaire ||
+      (await this.runInWorker('apiGet', '/api/ecli/bff/espace-documentaire'))
 
     const documents = (0,_parsing__WEBPACK_IMPORTED_MODULE_4__.parseDocuments)(docPayload, { attestations: false }, log)
     this.log('info', `Found ${documents.length} document(s) to save`)
