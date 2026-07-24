@@ -188,27 +188,25 @@ class GanContentScript extends ContentScript {
    * @returns {Promise<boolean>}
    */
   async waitForAuthOrLogin() {
-    // Poll for ~30s. The decision is made by an actual authenticated API call
-    // from inside the page (apiGet uses the page's own session cookies), which
-    // is the same call fetch() relies on and is proven to work when logged in:
-    //   - apiGet returns JSON        → session active  → authenticated;
-    //   - the #username field shows  → logged out;
-    // We also accept the passive signals (a Bearer API call seen, or the santé
-    // payload intercepted) as a fast path. This never hangs on the dashboard.
-    const deadline = 30000
-    const step = 1500
-    for (let waited = 0; waited < deadline; waited += step) {
-      // Fast path: passive signals already prove an active session.
+    // The active API probe is the ONLY reliable judge of the session, and it
+    // gets priority. On a trusted device, loading BASE_URL first shows the
+    // Keycloak login page (with #username) for ~1-2s before it auto-redirects
+    // to the dashboard — so the login field being present is NOT proof of being
+    // logged out. We therefore keep probing the authenticated API for a while;
+    // only if it never succeeds do we conclude the session is really gone.
+    //
+    // The probe uses the page's own session cookies on espace-documentaire,
+    // which we know answers JSON when logged in (fetch() collects the 30 PDFs
+    // from it). Its payload is cached so fetch() reuses it.
+    const probe = async () => {
+      // Passive fast paths first.
       if (
         this.store?.seenAuthenticatedApiCall ||
-        this.store?.interceptions?.['sante-full']
+        this.store?.interceptions?.['sante-full'] ||
+        this.store?.espaceDocumentaire
       ) {
         return true
       }
-      // Active probe: ask the page to call an authenticated API with its own
-      // session. We use espace-documentaire because we already know it answers
-      // JSON when logged in (fetch() collects the 30 PDFs from it), and cache it
-      // so fetch() can reuse it without a second call.
       const docs = await this.runInWorker(
         'apiGet',
         '/api/ecli/bff/espace-documentaire'
@@ -218,14 +216,31 @@ class GanContentScript extends ContentScript {
         this.store.espaceDocumentaire = docs
         return true
       }
-      // Otherwise, if the login field is present we are logged out.
-      if (await this.runInWorker('waitForLoginField')) {
-        return false
-      }
+      return false
+    }
+
+    // Insist for up to ~30s, but decide "logged out" as soon as the login field
+    // proves STABLE (present on several consecutive checks). A transient login
+    // page that auto-redirects on a trusted device never stays stable, so this
+    // reports logged in quickly when the session is valid and logged out
+    // quickly on a genuine logout — without a fixed 30s wait either way.
+    const deadline = 30000
+    const step = 1500
+    let stableLoginTicks = 0
+    for (let waited = 0; waited < deadline; waited += step) {
+      if (await probe()) return true
+
+      // Count consecutive ticks where the login field is present. Three in a row
+      // (~4.5s) with no successful probe means we really are on the login page.
+      const loginVisible = await this.runInWorker('waitForLoginField')
+      stableLoginTicks = loginVisible ? stableLoginTicks + 1 : 0
+      if (stableLoginTicks >= 3) return false
+
       await this.wait(step)
     }
-    // Timed out: last-resort DOM check.
-    return await this.runInWorker('checkAuthenticated')
+
+    // Timed out with no clear outcome: fall back to a last probe attempt.
+    return await probe()
   }
 
   /**
@@ -311,9 +326,12 @@ class GanContentScript extends ContentScript {
    */
   async apiGet(path) {
     try {
-      const url = path.startsWith('http')
-        ? path
-        : `${document.location.origin}${path}`
+      // Always target the espace client host: during an SSO redirect the worker
+      // may momentarily sit on authentification.ganassurances.fr, where these
+      // /api/ecli/* endpoints do not exist. A relative path is resolved against
+      // the espace client origin explicitly.
+      const base = 'https://espaceclient.ganassurances.fr'
+      const url = path.startsWith('http') ? path : `${base}${path}`
       const res = await window.fetch(url, {
         method: 'GET',
         credentials: 'include',
