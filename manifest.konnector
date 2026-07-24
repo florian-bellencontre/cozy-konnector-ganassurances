@@ -1,5 +1,5 @@
 {
-  "version": "1.0.9",
+  "version": "1.1.0",
   "name": "Gan Assurances",
   "type": "konnector",
   "language": "node",
@@ -17,13 +17,6 @@
     {
       "defaultDir": "$administrative/$konnector/$account"
     }
-  ],
-  "time_interval": [
-    0,
-    24
-  ],
-  "data_types": [
-    "bill"
   ],
   "permissions": {
     "carbon_copy": {
@@ -74,7 +67,5 @@
     "DOC_QUALIFICATION_V2",
     "HEALTH",
     "CARBON_COPY"
-  ],
-  "banksTransactionRegExp": "\\bgan\\b",
-  "manifest_version": "2"
+  ]
 }
