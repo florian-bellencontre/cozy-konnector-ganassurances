@@ -6479,9 +6479,6 @@ _cozy_minilog__WEBPACK_IMPORTED_MODULE_1___default().enable()
 // --- Site constants -------------------------------------------------------
 const BASE_URL = 'https://espaceclient.ganassurances.fr'
 const AUTH_HOST = 'authentification.ganassurances.fr'
-const HUB_SANTE_URL = `${BASE_URL}/front/hub/sante-prevoyance`
-// Documents area, filtered on the health reimbursement statements (real PDFs).
-const DOCS_URL = `${BASE_URL}/front/mes-documents?filter=RELEVE_DE_PRESTATIONS_SANTE`
 
 // Set to true only to re-map the API (logs every JSON endpoint + shapes) when
 // Gan changes its site. Normal operation is false.
@@ -6710,6 +6707,29 @@ class GanContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED_M
     return document.body?.innerText?.includes('The requested URL was rejected')
   }
 
+  /**
+   * Runs in the worker (inside the authenticated Gan page): GET a same-origin
+   * API endpoint and return its parsed JSON. Uses the page's own session
+   * (cookies) so no visible navigation is needed to collect data. Returns null
+   * on any failure so the pilot can fall back gracefully.
+   */
+  async apiGet(path) {
+    try {
+      const url = path.startsWith('http')
+        ? path
+        : `${document.location.origin}${path}`
+      const res = await window.fetch(url, {
+        method: 'GET',
+        credentials: 'include',
+        headers: { Accept: 'application/json' }
+      })
+      if (!res.ok) return null
+      return await res.json()
+    } catch (err) {
+      return null
+    }
+  }
+
   async fillLoginForm(credentials) {
     const shadowQuery = selector => {
       const walk = root => {
@@ -6768,19 +6788,23 @@ class GanContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED_M
   // -----------------------------------------------------------------------
   async getUserDataFromWebsite() {
     this.log('info', '🤖 getUserDataFromWebsite')
-    // The stable identifier is the santé contract number. Visit the santé hub
-    // so sante-prevoyance/full is intercepted, then read the contract id.
-    if (!this.getSanteContractId()) {
-      await Promise.all([
-        this.waitForInterceptionSafe('sante-full', { timeout: 45000 }),
-        (async () => {
-          await this.goto(HUB_SANTE_URL)
-          await this.waitForElementInWorker('body', {})
-        })()
-      ])
+    // The stable identifier is the santé contract number. Fetch the API
+    // directly (no visible navigation): the user is already authenticated, so
+    // the santé hub endpoint answers with the contract in `contratsSante[0]`.
+    let contractId = this.getSanteContractId()
+    if (!contractId) {
+      const full = await this.runInWorker(
+        'apiGet',
+        '/api/ecli/bff/hubs/sante-prevoyance/full'
+      )
+      contractId =
+        (Array.isArray(full?.contratsSante) &&
+          full.contratsSante[0]?.identifiant &&
+          String(full.contratsSante[0].identifiant)) ||
+        null
     }
     const sourceAccountIdentifier =
-      this.getSanteContractId() || this.store?.userCredentials?.login
+      contractId || this.store?.userCredentials?.login
     if (!sourceAccountIdentifier) {
       throw new Error(
         'No sourceAccountIdentifier found — the connector should be fixed'
@@ -6815,10 +6839,6 @@ class GanContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED_M
   async fetch(context) {
     this.log('info', '🤖 fetch')
 
-    // Data collection never needs the UI: keep the webview hidden so a manual
-    // sync does not linger on the Gan dashboard once the job is done.
-    await this.setWorkerState({ visible: false })
-
     if (this.store?.userCredentials) {
       await this.saveCredentials(this.store.userCredentials)
     }
@@ -6831,22 +6851,15 @@ class GanContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED_M
       return
     }
 
-    // Open the documents area (filtered on health statements). The SPA fires the
-    // espace-documentaire XHR, which we intercept to get the list of downloadable
-    // PDFs (each with a JWT id used to build its /api/ecli/edd/... download url).
-    const [docPayload] = await Promise.all([
-      this.waitForInterceptionSafe('espace-documentaire', { timeout: 45000 }),
-      (async () => {
-        await this.goto(DOCS_URL)
-        await this.waitForElementInWorker('body', {})
-      })()
-    ])
-
-    const documents = (0,_parsing__WEBPACK_IMPORTED_MODULE_4__.parseDocuments)(
-      docPayload && docPayload.response,
-      { attestations: false },
-      log
+    // Fetch the documents list directly from the API (no visible navigation to
+    // the documents page). We are authenticated, so the endpoint returns the
+    // relevés with their JWT ids used to build each /api/ecli/edd/... PDF url.
+    const docPayload = await this.runInWorker(
+      'apiGet',
+      '/api/ecli/bff/espace-documentaire'
     )
+
+    const documents = (0,_parsing__WEBPACK_IMPORTED_MODULE_4__.parseDocuments)(docPayload, { attestations: false }, log)
     this.log('info', `Found ${documents.length} document(s) to save`)
 
     const files = (0,_parsing__WEBPACK_IMPORTED_MODULE_4__.buildFiles)(documents)
@@ -7021,7 +7034,8 @@ connector
     additionalExposedMethodsNames: [
       'checkWafRejected',
       'fillLoginForm',
-      'scanNavigation'
+      'scanNavigation',
+      'apiGet'
     ]
   })
   .catch(err => {
