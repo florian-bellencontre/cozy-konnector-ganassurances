@@ -157,38 +157,6 @@ export function shortHash(str) {
 }
 
 /**
- * Build a minimal identity from intercepted responses. Deliberately keeps only
- * the name and, if present, the email — no address, phone or civil data.
- *
- * @param {object} [interceptions] - map label → intercepted payload
- * @returns {object|null}
- */
-export function buildIdentity(interceptions) {
-  if (!interceptions) return null
-  const contact = {}
-
-  for (const key of Object.keys(interceptions)) {
-    const r = interceptions[key]?.response
-    if (!r || typeof r !== 'object') continue
-
-    const given = r.given_name || r.prenom || r.firstName
-    const family = r.family_name || r.nom || r.lastName
-    if ((given || family) && !contact.name) {
-      contact.name = {}
-      if (given) contact.name.givenName = String(given)
-      if (family) contact.name.familyName = String(family)
-    }
-
-    const email = r.email || r.mail || r.adresseEmail
-    if (email && !contact.email) {
-      contact.email = [{ address: String(email) }]
-    }
-  }
-
-  return Object.keys(contact).length ? { contact } : null
-}
-
-/**
  * Parse a French-formatted or ISO date string into a Date.
  *
  * @param {string} value
@@ -218,21 +186,4 @@ export function parseFrDate(value) {
   }
   const fallback = new Date(str)
   return isNaN(fallback) ? null : fallback
-}
-
-/**
- * Parse an amount that may be a number, or a French string like "5,20 €".
- *
- * @param {*} value
- * @returns {number} NaN if unparsable
- */
-export function parseAmount(value) {
-  if (typeof value === 'number') return value
-  if (value == null) return NaN
-  const cleaned = String(value)
-    .replace(/[^\d,.-]/g, '')
-    .replace(/\.(?=\d{3}\b)/g, '') // thousands dot
-    .replace(',', '.')
-  const n = parseFloat(cleaned)
-  return Number.isFinite(n) ? n : NaN
 }

@@ -93,13 +93,6 @@ class GanContentScript extends ContentScript {
     this.store.interceptions = this.store.interceptions || {}
     this.store.interceptions[payload.label] = payload
 
-    // Capture the OIDC bearer token when present — needed later to download
-    // any PDF behind the authenticated API.
-    const auth =
-      payload?.requestHeaders?.Authorization ||
-      payload?.requestHeaders?.authorization
-    if (auth) this.store.token = auth
-
     if (DISCOVERY_MODE) {
       this.log(
         'info',
@@ -452,15 +445,6 @@ class GanContentScript extends ContentScript {
     const contrat = hub && Array.isArray(hub.contrats) && hub.contrats[0]
     const id = contrat && contrat.identifiant
     return id ? String(id) : null
-  }
-
-  /**
-   * Stable account id = the santé contract number, taken from the intercepted
-   * `sante-prevoyance/full` (contratsSante[0].identifiant). Falls back to the
-   * submitted login only if nothing better is available.
-   */
-  extractSourceAccountIdentifier() {
-    return this.getSanteContractId()
   }
 
   /** @returns {string|null} the santé contract id, or null */

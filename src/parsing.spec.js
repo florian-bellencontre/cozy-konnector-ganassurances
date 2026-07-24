@@ -1,21 +1,11 @@
 import {
   parseDocuments,
   buildFiles,
-  buildIdentity,
   summarizeJson,
-  parseAmount,
   parseFrDate,
   shortHash,
   DOC_DOWNLOAD_BASE
 } from './parsing'
-
-describe('parseAmount', () => {
-  it('passes through numbers and parses FR strings', () => {
-    expect(parseAmount(5.4)).toBe(5.4)
-    expect(parseAmount('5,40 €')).toBe(5.4)
-    expect(Number.isNaN(parseAmount('abc'))).toBe(true)
-  })
-})
 
 describe('parseFrDate', () => {
   it('parses ISO datetime without shifting the calendar day', () => {
@@ -121,26 +111,6 @@ describe('shortHash', () => {
   it('is stable and distinguishes inputs', () => {
     expect(shortHash('JWT_AAA')).toBe(shortHash('JWT_AAA'))
     expect(shortHash('JWT_AAA')).not.toBe(shortHash('JWT_BBB'))
-  })
-})
-
-describe('buildIdentity', () => {
-  it('keeps only name and email', () => {
-    const id = buildIdentity({
-      userinfo: {
-        response: {
-          given_name: 'Jean',
-          family_name: 'Dupont',
-          email: 'j@d.fr',
-          address: 'ignored'
-        }
-      }
-    })
-    expect(id.contact.name).toEqual({ givenName: 'Jean', familyName: 'Dupont' })
-    expect(id.contact.address).toBeUndefined()
-  })
-  it('returns null when nothing usable', () => {
-    expect(buildIdentity({})).toBeNull()
   })
 })
 
