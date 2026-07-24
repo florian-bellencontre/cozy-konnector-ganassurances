@@ -119,7 +119,16 @@ export default class RequestInterceptor {
     // Discovery aid: emit a lightweight "sawRequest" for EVERY xhr/fetch so the
     // pilot can map the API even when nothing matches the interception list.
     // Only url/method/content-type are exposed here — never the body.
+    //
+    // `authenticated` is a boolean signal only: true when the call carried an
+    // `Authorization: Bearer` header on an API call (`/api/`). A Keycloak login
+    // page never calls the business API with a Bearer, so this is a reliable
+    // "the session is active" signal that needs no DOM selector guessing.
     try {
+      const rh = resp.requestHeaders || {}
+      const authHeader = rh.Authorization || rh.authorization || ''
+      const isBearerApiCall =
+        /bearer/i.test(String(authHeader)) && /\/api\//.test(resp.url || '')
       this.emit('sawRequest', {
         method: resp.method,
         url: resp.url,
@@ -127,7 +136,8 @@ export default class RequestInterceptor {
           (resp.responseHeaders &&
             (resp.responseHeaders['content-type'] ||
               resp.responseHeaders['Content-Type'])) ||
-          ''
+          '',
+        authenticated: isBearerApiCall
       })
     } catch (e) {
       // ignore
