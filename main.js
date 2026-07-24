@@ -6605,6 +6605,10 @@ class GanContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED_M
 
     if (await this.runInWorker('checkAuthenticated')) {
       this.log('info', 'Already authenticated')
+      // No user input needed on this path: make sure the webview stays hidden so
+      // a manual sync runs silently in the background (like directenergie), and
+      // does not leave the Gan dashboard open in the app.
+      await this.setWorkerState({ visible: false })
       this.unblockWorkerInteractions()
       return true
     }
@@ -6810,6 +6814,10 @@ class GanContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED_M
   // -----------------------------------------------------------------------
   async fetch(context) {
     this.log('info', '🤖 fetch')
+
+    // Data collection never needs the UI: keep the webview hidden so a manual
+    // sync does not linger on the Gan dashboard once the job is done.
+    await this.setWorkerState({ visible: false })
 
     if (this.store?.userCredentials) {
       await this.saveCredentials(this.store.userCredentials)
