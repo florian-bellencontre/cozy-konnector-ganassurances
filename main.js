@@ -6047,7 +6047,16 @@ class RequestInterceptor {
     // Discovery aid: emit a lightweight "sawRequest" for EVERY xhr/fetch so the
     // pilot can map the API even when nothing matches the interception list.
     // Only url/method/content-type are exposed here — never the body.
+    //
+    // `authenticated` is a boolean signal only: true when the call carried an
+    // `Authorization: Bearer` header on an API call (`/api/`). A Keycloak login
+    // page never calls the business API with a Bearer, so this is a reliable
+    // "the session is active" signal that needs no DOM selector guessing.
     try {
+      const rh = resp.requestHeaders || {}
+      const authHeader = rh.Authorization || rh.authorization || ''
+      const isBearerApiCall =
+        /bearer/i.test(String(authHeader)) && /\/api\//.test(resp.url || '')
       this.emit('sawRequest', {
         method: resp.method,
         url: resp.url,
@@ -6055,7 +6064,8 @@ class RequestInterceptor {
           (resp.responseHeaders &&
             (resp.responseHeaders['content-type'] ||
               resp.responseHeaders['Content-Type'])) ||
-          ''
+          '',
+        authenticated: isBearerApiCall
       })
     } catch (e) {
       // ignore
@@ -6540,6 +6550,12 @@ class GanContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED_M
     } else if (event === 'interceptedResponse') {
       this.onInterceptedResponse(payload)
     } else if (event === 'sawRequest') {
+      // A Bearer-authenticated API call means the session is active. Record it
+      // as a reliable "authenticated" signal (no DOM selector guessing needed).
+      if (payload?.authenticated) {
+        this.store = this.store || {}
+        this.store.seenAuthenticatedApiCall = true
+      }
       if (DISCOVERY_MODE && /json/i.test(payload.contentType || '')) {
         // Only surface JSON endpoints — those are the API calls worth mapping.
         this.log('info', `📡 API ${payload.method} ${payload.url}`)
@@ -6580,16 +6596,25 @@ class GanContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED_M
     this.log('info', '🤖 ensureAuthenticated')
     this.bridge.addEventListener('workerEvent', this.onWorkerEvent.bind(this))
 
-    // On a fresh connection (no account yet), make sure we start logged out so
-    // the user goes through the login + SMS explicitly.
-    if (!account) {
+    const credentials = await this.getCredentials()
+
+    // Reset the per-run "session active" signal so a stale value from a previous
+    // run can never make us skip a genuinely-needed login.
+    this.store = this.store || {}
+    this.store.seenAuthenticatedApiCall = false
+
+    // ONLY force a logout on a brand-new connection (no account AND no saved
+    // credentials), so the user goes through login + SMS explicitly. On a
+    // re-sync of an existing account we must NEVER log out: the trusted-device
+    // session is exactly what lets the sync run silently. (This is the bug that
+    // made manual syncs re-open the login form even while logged in.)
+    if (!account && !credentials) {
       await this.ensureNotAuthenticated()
     }
 
-    // Go to the espace client. If the session is still valid (trusted device),
-    // we land on the dashboard; otherwise we are redirected to the Keycloak
-    // login. Let the page settle, then decide — no rigid waits that could time
-    // out on the already-authenticated path.
+    // Load the espace client. If the trusted-device session is valid we land on
+    // the dashboard (the SPA fires sante-prevoyance/full, which we intercept);
+    // otherwise we are redirected to the Keycloak login (#username shows up).
     await this.goto(BASE_URL)
     await this.waitForDomReadySafe()
 
@@ -6600,23 +6625,19 @@ class GanContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED_M
       return true
     }
 
-    // Decide the session from the API itself, not from a snapshot of the URL:
-    // right after landing, Gan may briefly bounce through the SSO host to
-    // refresh the token even when the session is valid. Poll the santé endpoint
-    // a few times — a 200 with JSON means we are authenticated for good.
-    if (await this.runInWorker('checkAuthenticated')) {
+    // Decide the session by racing the possible outcomes (never a URL snapshot,
+    // since Gan may briefly bounce through the SSO host on a valid session).
+    if (await this.waitForAuthOrLogin()) {
       this.log('info', 'Already authenticated')
-      // No user input needed on this path: keep the webview hidden so a manual
-      // sync runs silently in the background (like directenergie).
+      // No user input needed: keep the webview hidden so the sync stays silent.
       await this.setWorkerState({ visible: false })
       this.unblockWorkerInteractions()
       return true
     }
 
-    // Not authenticated: pre-fill known credentials if any (never auto-submit —
-    // the WAF and SMS 2FA make full automation unreliable), then let the user
-    // finish the login and the SMS code themselves in the visible webview.
-    const credentials = await this.getCredentials()
+    // Logged out: pre-fill the saved login if any (never auto-submit — the WAF
+    // and SMS 2FA make full automation unreliable), then let the user finish
+    // the login and the SMS code in the visible webview.
     if (credentials?.login) {
       await this.autoFill(credentials).catch(() => {})
     }
@@ -6633,6 +6654,41 @@ class GanContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED_M
     )
     await this.waitForDomReadySafe()
     return true
+  }
+
+  /**
+   * After loading the espace client, decide the session by racing the two
+   * possible outcomes, without ever throwing:
+   *   - the SPA's own call to sante-prevoyance/full is intercepted → logged in;
+   *   - the Keycloak login field (#username) appears → logged out.
+   * Returns true if authenticated, false otherwise. A generous timeout absorbs
+   * the SSO token-refresh bounce that can happen on a valid session.
+   *
+   * @returns {Promise<boolean>}
+   */
+  async waitForAuthOrLogin() {
+    // Poll for ~35s, deciding on whichever reliable signal appears first:
+    //   authenticated  → a Bearer-authenticated API call was seen, OR the santé
+    //                    payload was intercepted (both prove an active session);
+    //   logged out     → the Keycloak login field (#username) is present.
+    // The login page never issues a Bearer API call, so these never collide.
+    const deadline = 35000
+    const step = 1000
+    for (let waited = 0; waited < deadline; waited += step) {
+      if (
+        this.store?.seenAuthenticatedApiCall ||
+        this.store?.interceptions?.['sante-full']
+      ) {
+        return true
+      }
+      if (await this.runInWorker('waitForLoginField')) {
+        return false
+      }
+      await this.wait(step)
+    }
+    // Timed out with no clear signal: fall back to the DOM check (login field
+    // absent on the espace client domain → treat as authenticated).
+    return await this.runInWorker('checkAuthenticated')
   }
 
   /**
@@ -6764,46 +6820,40 @@ class GanContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED_M
   }
 
   /**
-   * Runs in the worker. Authenticated iff an authenticated same-origin API call
-   * succeeds. This is far more reliable than inspecting the URL: right after
-   * landing, Gan may briefly bounce through the SSO host to refresh the token
-   * even when the session is valid — a URL snapshot would wrongly read "logged
-   * out". We poll the santé endpoint a few times to let any redirect settle.
-   *
-   * Returning false keeps the visible webview open so the user can log in / do
-   * the SMS 2FA.
+   * Runs in the worker. Used by the base `waitForAuthenticated` (polled after a
+   * manual login) to know when the session is established. Authenticated iff we
+   * are on the espace client domain, past the OAuth redirect, and NOT showing
+   * the Keycloak login field. This is polled, so a URL check is fine here — the
+   * loop tolerates the brief SSO bounce (it just keeps polling until we land).
    */
   async checkAuthenticated() {
-    // If we are visibly parked on the identity provider's SMS/login step, we are
-    // clearly not done — no need to probe the API.
     const href = document.location.href
-    if (href.includes('authentification.ganassurances.fr')) {
+    // Still on the identity provider (login or SMS step) → not done.
+    if (href.includes('authentification.ganassurances.fr')) return false
+    if (!href.includes('espaceclient.ganassurances.fr')) return false
+    if (href.includes('/login/oauth2/')) return false
+    // On the espace client, but make sure the login field is not somehow present.
+    return !this.hasLoginField()
+  }
+
+  /**
+   * Runs in the worker: true once the Keycloak login field (#username) is
+   * present. Used to detect the logged-out outcome without inspecting the URL.
+   */
+  async waitForLoginField() {
+    return this.hasLoginField()
+  }
+
+  /** Shadow-DOM-aware check for the presence of the Keycloak username field. */
+  hasLoginField() {
+    const walk = root => {
+      if (root.querySelector('#username')) return true
+      for (const el of root.querySelectorAll('*')) {
+        if (el.shadowRoot && walk(el.shadowRoot)) return true
+      }
       return false
     }
-
-    const probe = async () => {
-      try {
-        const res = await window.fetch(
-          `${document.location.origin}/api/ecli/bff/hubs/sante-prevoyance/full`,
-          {
-            method: 'GET',
-            credentials: 'include',
-            headers: { Accept: 'application/json' }
-          }
-        )
-        if (!res.ok) return false
-        const json = await res.json()
-        return !!(json && typeof json === 'object')
-      } catch (err) {
-        return false
-      }
-    }
-
-    for (let i = 0; i < 5; i++) {
-      if (await probe()) return true
-      await new Promise(resolve => setTimeout(resolve, 1500))
-    }
-    return false
+    return walk(document)
   }
 
   // -----------------------------------------------------------------------
@@ -7058,7 +7108,8 @@ connector
       'checkWafRejected',
       'fillLoginForm',
       'scanNavigation',
-      'apiGet'
+      'apiGet',
+      'waitForLoginField'
     ]
   })
   .catch(err => {
