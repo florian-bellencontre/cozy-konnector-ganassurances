@@ -150,8 +150,11 @@ class GanContentScript extends ContentScript {
     // since Gan may briefly bounce through the SSO host on a valid session).
     if (await this.waitForAuthOrLogin()) {
       this.log('info', 'Already authenticated')
-      // No user input needed: keep the webview hidden so the sync stays silent.
-      await this.setWorkerState({ visible: false })
+      // Do NOT touch the worker visibility here: the webview is hidden by
+      // default and only shown by an explicit setWorkerState({visible:true}).
+      // directenergie never sets visibility on this path, so the sync stays
+      // silent. Calling visible:false here was making the launcher flash the
+      // webview on-screen instead of keeping it hidden.
       this.unblockWorkerInteractions()
       return true
     }
