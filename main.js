@@ -6138,8 +6138,6 @@ __webpack_require__.r(__webpack_exports__);
 /* harmony export */ __webpack_require__.d(__webpack_exports__, {
 /* harmony export */   DOC_DOWNLOAD_BASE: () => (/* binding */ DOC_DOWNLOAD_BASE),
 /* harmony export */   buildFiles: () => (/* binding */ buildFiles),
-/* harmony export */   buildIdentity: () => (/* binding */ buildIdentity),
-/* harmony export */   parseAmount: () => (/* binding */ parseAmount),
 /* harmony export */   parseDocuments: () => (/* binding */ parseDocuments),
 /* harmony export */   parseFrDate: () => (/* binding */ parseFrDate),
 /* harmony export */   shortHash: () => (/* binding */ shortHash),
@@ -6304,38 +6302,6 @@ function shortHash(str) {
 }
 
 /**
- * Build a minimal identity from intercepted responses. Deliberately keeps only
- * the name and, if present, the email — no address, phone or civil data.
- *
- * @param {object} [interceptions] - map label → intercepted payload
- * @returns {object|null}
- */
-function buildIdentity(interceptions) {
-  if (!interceptions) return null
-  const contact = {}
-
-  for (const key of Object.keys(interceptions)) {
-    const r = interceptions[key]?.response
-    if (!r || typeof r !== 'object') continue
-
-    const given = r.given_name || r.prenom || r.firstName
-    const family = r.family_name || r.nom || r.lastName
-    if ((given || family) && !contact.name) {
-      contact.name = {}
-      if (given) contact.name.givenName = String(given)
-      if (family) contact.name.familyName = String(family)
-    }
-
-    const email = r.email || r.mail || r.adresseEmail
-    if (email && !contact.email) {
-      contact.email = [{ address: String(email) }]
-    }
-  }
-
-  return Object.keys(contact).length ? { contact } : null
-}
-
-/**
  * Parse a French-formatted or ISO date string into a Date.
  *
  * @param {string} value
@@ -6365,23 +6331,6 @@ function parseFrDate(value) {
   }
   const fallback = new Date(str)
   return isNaN(fallback) ? null : fallback
-}
-
-/**
- * Parse an amount that may be a number, or a French string like "5,20 €".
- *
- * @param {*} value
- * @returns {number} NaN if unparsable
- */
-function parseAmount(value) {
-  if (typeof value === 'number') return value
-  if (value == null) return NaN
-  const cleaned = String(value)
-    .replace(/[^\d,.-]/g, '')
-    .replace(/\.(?=\d{3}\b)/g, '') // thousands dot
-    .replace(',', '.')
-  const n = parseFloat(cleaned)
-  return Number.isFinite(n) ? n : NaN
 }
 
 
@@ -6571,13 +6520,6 @@ class GanContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED_M
     this.store = this.store || {}
     this.store.interceptions = this.store.interceptions || {}
     this.store.interceptions[payload.label] = payload
-
-    // Capture the OIDC bearer token when present — needed later to download
-    // any PDF behind the authenticated API.
-    const auth =
-      payload?.requestHeaders?.Authorization ||
-      payload?.requestHeaders?.authorization
-    if (auth) this.store.token = auth
 
     if (DISCOVERY_MODE) {
       this.log(
@@ -6931,15 +6873,6 @@ class GanContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED_M
     const contrat = hub && Array.isArray(hub.contrats) && hub.contrats[0]
     const id = contrat && contrat.identifiant
     return id ? String(id) : null
-  }
-
-  /**
-   * Stable account id = the santé contract number, taken from the intercepted
-   * `sante-prevoyance/full` (contratsSante[0].identifiant). Falls back to the
-   * submitted login only if nothing better is available.
-   */
-  extractSourceAccountIdentifier() {
-    return this.getSanteContractId()
   }
 
   /** @returns {string|null} the santé contract id, or null */
