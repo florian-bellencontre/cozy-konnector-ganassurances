@@ -6138,6 +6138,7 @@ __webpack_require__.r(__webpack_exports__);
 /* harmony export */ __webpack_require__.d(__webpack_exports__, {
 /* harmony export */   DOC_DOWNLOAD_BASE: () => (/* binding */ DOC_DOWNLOAD_BASE),
 /* harmony export */   buildFiles: () => (/* binding */ buildFiles),
+/* harmony export */   describeShape: () => (/* binding */ describeShape),
 /* harmony export */   parseDocuments: () => (/* binding */ parseDocuments),
 /* harmony export */   parseFrDate: () => (/* binding */ parseFrDate),
 /* harmony export */   shortHash: () => (/* binding */ shortHash),
@@ -6178,6 +6179,40 @@ function summarizeJson(json) {
   } catch (err) {
     return 'unserializable'
   }
+}
+
+/**
+ * PII-safe structural description of a JSON value: key names + value TYPES only,
+ * never the values themselves. Used in discovery mode to locate the amount /
+ * date / reimbursement fields in Gan's payloads without ever logging personal
+ * or financial data. Arrays are summarized by their length and the shape of
+ * their first item.
+ *
+ * @param {*} value
+ * @param {number} [maxDepth]
+ * @param {number} [depth]
+ * @returns {*} a nested {key: 'type'} structure, JSON-stringifiable
+ */
+function describeShape(value, maxDepth = 5, depth = 0) {
+  if (value === null || value === undefined) return value === null ? 'null' : 'undefined'
+  if (Array.isArray(value)) {
+    if (value.length === 0) return 'Array(0)'
+    return {
+      [`Array(${value.length})`]:
+        depth >= maxDepth ? '…' : describeShape(value[0], maxDepth, depth + 1)
+    }
+  }
+  const t = typeof value
+  if (t === 'object') {
+    if (depth >= maxDepth) return '{…}'
+    const out = {}
+    for (const key of Object.keys(value)) {
+      out[key] = describeShape(value[key], maxDepth, depth + 1)
+    }
+    return out
+  }
+  // Primitive: return the type name only (never the value).
+  return t
 }
 
 // Base download URL for a document (a real PDF). The document `identifiant`
@@ -6441,7 +6476,10 @@ const AUTH_HOST = 'authentification.ganassurances.fr'
 
 // Set to true only to re-map the API (logs every JSON endpoint + shapes) when
 // Gan changes its site. Normal operation is false.
-const DISCOVERY_MODE = false
+// TEMPORARILY true: reconnaissance run to locate the reimbursement AMOUNTS and
+// the cotisation documents needed for Banks matching (io.cozy.bills). Flip back
+// to false once the shapes are captured.
+const DISCOVERY_MODE = true
 
 // Endpoints we intercept (JSON bodies). Confirmed by recon:
 // - sante-prevoyance/full → contract id (contratsSante[0].identifiant)
@@ -6505,9 +6543,18 @@ class GanContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED_M
         this.store = this.store || {}
         this.store.seenAuthenticatedApiCall = true
       }
-      if (DISCOVERY_MODE && /json/i.test(payload.contentType || '')) {
-        // Only surface JSON endpoints — those are the API calls worth mapping.
-        this.log('info', `📡 API ${payload.method} ${payload.url}`)
+      if (DISCOVERY_MODE) {
+        // Remember every GET /api/ URL the SPA fires so runDiscovery can re-fetch
+        // each one and dump its (PII-safe) shape — this is how we find the
+        // reimbursement/cotisation endpoints that actually carry the amounts.
+        const url = payload.url || ''
+        if (payload.method === 'GET' && /\/api\//.test(url)) {
+          this.store.seenApiUrls = this.store.seenApiUrls || []
+          if (!this.store.seenApiUrls.includes(url)) {
+            this.store.seenApiUrls.push(url)
+            this.log('info', `📡 API ${payload.method} ${url}`)
+          }
+        }
       }
     }
   }
@@ -6959,7 +7006,7 @@ class GanContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED_M
     // Visit each same-origin candidate whose label smells like health/refunds,
     // pausing so the SPA fires (and we intercept) its API calls.
     const candidates = links.filter(l =>
-      /rembours|santé|sante|décompte|decompte|prestation|garantie|soin|mes remboursements/i.test(
+      /rembours|santé|sante|décompte|decompte|prestation|garantie|soin|mes remboursements|cotisation|prélèvement|prelevement|échéance|echeance|quittance|paiement|contrat/i.test(
         l.text
       )
     )
@@ -7006,10 +7053,64 @@ class GanContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED_M
     }
     // Final settle time to catch late XHR calls.
     await this.wait(5000)
+
+    // Now re-fetch every API endpoint we saw (plus a few likely guesses) and
+    // dump its STRUCTURE only (key names + types, never values). This is what
+    // reveals where the reimbursement amounts and the cotisation documents live.
+    await this.dumpApiShapes()
+
     this.log(
       'info',
-      '🔎 DISCOVERY done — send me the 📡 API and 🔎 DISCOVERY (→ keys) lines above.'
+      '🔎 DISCOVERY done — send me every 📡 API and 🔬 SHAPE line above.'
     )
+  }
+
+  /**
+   * Re-fetch each seen (and a few guessed) GET /api/ endpoint and log its
+   * PII-safe structural description. Amounts/dates/beneficiaries are located by
+   * their KEY NAMES here — no value is ever logged.
+   */
+  async dumpApiShapes() {
+    const seen = this.store?.seenApiUrls || []
+    // A few educated guesses for endpoints the dashboard may not call on its own
+    // (reimbursements detail, cotisations/quittances). Harmless if they 404.
+    const guesses = [
+      '/api/ecli/bff/hubs/sante-prevoyance/full',
+      '/api/ecli/bff/hubs/sante-prevoyance/remboursements',
+      '/api/ecli/bff/hubs/sante-prevoyance/decomptes',
+      '/api/ecli/bff/hubs/sante-prevoyance/prestations',
+      '/api/ecli/bff/remboursements',
+      '/api/ecli/bff/decomptes',
+      '/api/ecli/bff/prestations',
+      '/api/ecli/bff/cotisations',
+      '/api/ecli/bff/quittances',
+      '/api/ecli/bff/echeances',
+      '/api/ecli/bff/espace-documentaire'
+    ]
+    // Normalize seen absolute URLs to same-origin paths, dedupe with the guesses.
+    const paths = []
+    for (const u of seen) {
+      const p = String(u).replace(/^https?:\/\/[^/]+/, '')
+      if (p.startsWith('/api/') && !paths.includes(p)) paths.push(p)
+    }
+    for (const g of guesses) if (!paths.includes(g)) paths.push(g)
+
+    this.log('info', `🔬 dumping shapes for ${paths.length} endpoint(s)`)
+    for (const path of paths) {
+      try {
+        const body = await this.runInWorker('apiGet', path)
+        if (body && typeof body === 'object') {
+          this.log(
+            'info',
+            `🔬 SHAPE ${path} → ${JSON.stringify((0,_parsing__WEBPACK_IMPORTED_MODULE_4__.describeShape)(body))}`
+          )
+        } else {
+          this.log('info', `🔬 SHAPE ${path} → (no JSON / not accessible)`)
+        }
+      } catch (err) {
+        this.log('info', `🔬 SHAPE ${path} → error ${err.message}`)
+      }
+    }
   }
 
   /**
