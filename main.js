@@ -6309,16 +6309,26 @@ function normalizeDocument(raw) {
  * @returns {Array<object>}
  */
 function buildFiles(documents) {
-  return documents.map((d, index) => {
+  // Count documents per publication date so a numeric suffix is added ONLY when
+  // two relevés truly share the same date (normally ~1 per month → clean
+  // date-only names). The old code suffixed by global index, so every file got
+  // a meaningless _1.._30.
+  const perDate = {}
+  for (const d of documents) {
+    const key = (d.date || new Date()).toISOString().slice(0, 10)
+    perDate[key] = (perDate[key] || 0) + 1
+  }
+  const usedPerDate = {}
+  return documents.map(d => {
     const date = d.date || new Date()
     const dateStr = date.toISOString().slice(0, 10)
     // A short, stable ref: the document JWT is long, so hash it by content.
     const vendorRef = `${dateStr}-${shortHash(d.id)}`
+    usedPerDate[dateStr] = (usedPerDate[dateStr] || 0) + 1
+    const suffix = perDate[dateStr] > 1 ? `_${usedPerDate[dateStr]}` : ''
     return {
       vendorRef,
-      filename: `${dateStr}_gan_releve_prestations${
-        documents.length > 1 ? '_' + (index + 1) : ''
-      }.pdf`,
+      filename: `${dateStr}_gan_releve_prestations${suffix}.pdf`,
       fileurl: d.fileurl,
       fileAttributes: {
         metadata: {
@@ -6590,10 +6600,11 @@ const AUTH_HOST = 'authentification.ganassurances.fr'
 // Gan changes its site. Normal operation is false. Confirmed by the last
 // reconnaissance run: reimbursement amounts live in sante-prevoyance/full →
 // remboursementsRecents[].montantDuVersement (the amount actually paid to the
-// bank), and there is no full-history reimbursement endpoint.
-// TEMPORARILY true: focused recon to learn whether each relevé document carries
-// its own amount (which would unlock full-history bills). Flip back to false.
-const DISCOVERY_MODE = true
+// bank), and there is no full-history reimbursement endpoint. Confirmed: relevé
+// documents carry NO amount ({identifiant, libelle, codeType, isNew,
+// datePublication}), so only the recent reimbursements can become matchable
+// bills — history cannot be reconstructed.
+const DISCOVERY_MODE = false
 
 // Endpoints we intercept (JSON bodies). Confirmed by recon:
 // - sante-prevoyance/full → contract id (contratsSante[0].identifiant)
