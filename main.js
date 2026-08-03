@@ -6591,7 +6591,9 @@ const AUTH_HOST = 'authentification.ganassurances.fr'
 // reconnaissance run: reimbursement amounts live in sante-prevoyance/full →
 // remboursementsRecents[].montantDuVersement (the amount actually paid to the
 // bank), and there is no full-history reimbursement endpoint.
-const DISCOVERY_MODE = false
+// TEMPORARILY true: focused recon to learn whether each relevé document carries
+// its own amount (which would unlock full-history bills). Flip back to false.
+const DISCOVERY_MODE = true
 
 // Endpoints we intercept (JSON bodies). Confirmed by recon:
 // - sante-prevoyance/full → contract id (contratsSante[0].identifiant)
@@ -7060,10 +7062,26 @@ class GanContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED_M
     }
 
     if (DISCOVERY_MODE) {
-      // Kept for future re-discovery; not used in normal operation.
-      await this.goto(BASE_URL)
-      await this.waitForElementInWorker('body', {})
-      await this.runDiscovery()
+      // Focused recon: the deep, un-truncated shape of ONE relevé document and
+      // ONE recent reimbursement — we specifically want to know if a document
+      // carries its own amount (montant/total), which would let us build a
+      // matchable bill for the WHOLE history instead of only the 3 recent ones.
+      const docsPayload = await this.runInWorker(
+        'apiGet',
+        '/api/ecli/bff/espace-documentaire'
+      )
+      const fullPayload = await this.runInWorker(
+        'apiGet',
+        '/api/ecli/bff/hubs/sante-prevoyance/full'
+      )
+      const firstDoc =
+        docsPayload?.hubs?.[0]?.contrats?.[0]?.documents?.[0] || null
+      const firstRemb = fullPayload?.remboursementsRecents?.[0] || null
+      this.log('info', `🔬 DOC0 → ${JSON.stringify((0,_parsing__WEBPACK_IMPORTED_MODULE_4__.describeShape)(firstDoc, 8))}`)
+      this.log(
+        'info',
+        `🔬 REMB0 → ${JSON.stringify((0,_parsing__WEBPACK_IMPORTED_MODULE_4__.describeShape)(firstRemb, 8))}`
+      )
       return
     }
 
