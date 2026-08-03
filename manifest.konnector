@@ -1,5 +1,5 @@
 {
-  "version": "1.1.9",
+  "version": "1.2.0",
   "name": "Gan Assurances",
   "type": "konnector",
   "language": "node",
@@ -12,6 +12,10 @@
   "categories": [
     "insurance"
   ],
+  "data_types": [
+    "bill"
+  ],
+  "banksTransactionRegExp": "(groupama gan|gan vie|gan assurance)",
   "fields": {},
   "folders": [
     {

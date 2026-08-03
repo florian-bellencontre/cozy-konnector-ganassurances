@@ -6137,10 +6137,14 @@ microee__WEBPACK_IMPORTED_MODULE_0___default().mixin(RequestInterceptor)
 __webpack_require__.r(__webpack_exports__);
 /* harmony export */ __webpack_require__.d(__webpack_exports__, {
 /* harmony export */   DOC_DOWNLOAD_BASE: () => (/* binding */ DOC_DOWNLOAD_BASE),
+/* harmony export */   GAN_LABEL_REGEX: () => (/* binding */ GAN_LABEL_REGEX),
 /* harmony export */   buildFiles: () => (/* binding */ buildFiles),
+/* harmony export */   buildRefundBills: () => (/* binding */ buildRefundBills),
 /* harmony export */   describeShape: () => (/* binding */ describeShape),
+/* harmony export */   monthKey: () => (/* binding */ monthKey),
 /* harmony export */   parseDocuments: () => (/* binding */ parseDocuments),
 /* harmony export */   parseFrDate: () => (/* binding */ parseFrDate),
+/* harmony export */   parseReimbursements: () => (/* binding */ parseReimbursements),
 /* harmony export */   shortHash: () => (/* binding */ shortHash),
 /* harmony export */   summarizeJson: () => (/* binding */ summarizeJson)
 /* harmony export */ });
@@ -6214,6 +6218,14 @@ function describeShape(value, maxDepth = 5, depth = 0) {
   // Primitive: return the type name only (never the value).
   return t
 }
+
+// Regex (lowercase — cozy-banks lowercases labels before matching) that a Gan
+// health-reimbursement bank credit's label matches, e.g.
+// "virement groupama gan vie vir soin ...". Set on each bill as
+// matchingCriterias.labelRegex so cozy-banks reconciles the bill with the
+// transaction WITHOUT relying on its internal brands dictionary (which does not
+// know Gan) or the apps registry. Keep in sync with manifest banksTransactionRegExp.
+const GAN_LABEL_REGEX = '(groupama gan|gan vie|gan assurance)'
 
 // Base download URL for a document (a real PDF). The document `identifiant`
 // (a JWT) is appended, plus the `/pdf?print=false` suffix. Confirmed via
@@ -6319,6 +6331,106 @@ function buildFiles(documents) {
       }
     }
   })
+}
+
+/**
+ * Year+month key of a Date (UTC), used to reconcile a reimbursement (by its
+ * payment date) with the monthly "relevé de prestations" PDF of the same month.
+ * @param {Date} date
+ * @returns {string} e.g. "2026-6" (month is 0-based, only used as a map key)
+ */
+function monthKey(date) {
+  return `${date.getUTCFullYear()}-${date.getUTCMonth()}`
+}
+
+/**
+ * Extract the recent reimbursements (health "versements") from the
+ * sante-prevoyance/full payload. Gan only exposes the few most recent ones
+ * (`remboursementsRecents`), each carrying the amount actually paid to the bank
+ * account — which is exactly what a bank credit shows.
+ *
+ * We keep ONLY the amount and the payment date: no beneficiary / care date /
+ * recipient name is ever propagated to a bill (privacy + health data).
+ *
+ * Real shape (GET /api/ecli/bff/hubs/sante-prevoyance/full):
+ *   remboursementsRecents: [ { montantDuVersement:number, dateDuVersement:string,
+ *     dateDuSoin, destinataireDuPaiement, beneficiaireDesSoins, action } ]
+ *
+ * @param {*} santeFull
+ * @returns {Array<{amount:number, date:Date}>}
+ */
+function parseReimbursements(santeFull) {
+  if (!santeFull || typeof santeFull !== 'object') return []
+  const list = Array.isArray(santeFull.remboursementsRecents)
+    ? santeFull.remboursementsRecents
+    : []
+  const out = []
+  for (const r of list) {
+    const amount =
+      typeof r.montantDuVersement === 'number'
+        ? r.montantDuVersement
+        : Number(r.montantDuVersement)
+    const date = parseFrDate(r.dateDuVersement)
+    // Only refunds we can actually match: a positive amount and a real date.
+    if (!Number.isFinite(amount) || amount <= 0 || !date) continue
+    out.push({ amount, date })
+  }
+  return out
+}
+
+/**
+ * Build `io.cozy.bills` entries for the reimbursements, each linked to the
+ * monthly relevé PDF of the same month. cozy-clisk's saveBills downloads the
+ * file then links the bill, and DROPS any bill without an associated file — so
+ * a reimbursement whose month has no relevé yet is intentionally skipped (it
+ * will link on a later sync once the relevé is published).
+ *
+ * The file part of each bill reuses the EXACT file entry (same vendorRef /
+ * filename / fileurl) produced by buildFiles, so the file dedup merges the
+ * bill's invoice and the plain saved file into a single Drive document — and
+ * several reimbursements of the same month share that one PDF.
+ *
+ * @param {Array<{amount:number, date:Date}>} reimbursements
+ * @param {Array<object>} documents - normalized docs (from parseDocuments)
+ * @param {Array<object>} fileEntries - file entries (from buildFiles), aligned
+ *                                       by index with `documents`
+ * @returns {Array<object>} bill entries for saveBills
+ */
+function buildRefundBills(reimbursements, documents, fileEntries) {
+  // First relevé PDF of each month (there is ~1 per month).
+  const monthToIndex = new Map()
+  documents.forEach((doc, index) => {
+    if (!doc.date) return
+    const key = monthKey(doc.date)
+    if (!monthToIndex.has(key)) monthToIndex.set(key, index)
+  })
+
+  const bills = []
+  for (const r of reimbursements) {
+    const index = monthToIndex.get(monthKey(r.date))
+    if (index === undefined) continue // no relevé to attach → cannot save a bill
+    const file = fileEntries[index]
+    bills.push({
+      ...file, // vendorRef, filename, fileurl, fileAttributes
+      // 'health_costs' makes cozy-banks treat this as a health bill so its
+      // byCategory filter keeps the (health-categorized) reimbursement credit;
+      // without it the pair is rejected. Same value ameli uses.
+      type: 'health_costs',
+      // montantDuVersement is already the amount of the whole payment (the bank
+      // credit), so `amount` matches the transaction directly — no groupAmount
+      // needed (ameli needs it only because it works act-by-act).
+      amount: r.amount,
+      date: r.date,
+      vendor: 'Gan Assurances',
+      isRefund: true,
+      currency: 'EUR',
+      // Drives cozy-banks matching directly (highest-priority criterion), so it
+      // does not fall back to the vendor name "Gan Assurances" — which would
+      // never match a "GROUPAMA GAN VIE" transaction label.
+      matchingCriterias: { labelRegex: GAN_LABEL_REGEX }
+    })
+  }
+  return bills
 }
 
 /**
@@ -6475,11 +6587,11 @@ const BASE_URL = 'https://espaceclient.ganassurances.fr'
 const AUTH_HOST = 'authentification.ganassurances.fr'
 
 // Set to true only to re-map the API (logs every JSON endpoint + shapes) when
-// Gan changes its site. Normal operation is false.
-// TEMPORARILY true: reconnaissance run to locate the reimbursement AMOUNTS and
-// the cotisation documents needed for Banks matching (io.cozy.bills). Flip back
-// to false once the shapes are captured.
-const DISCOVERY_MODE = true
+// Gan changes its site. Normal operation is false. Confirmed by the last
+// reconnaissance run: reimbursement amounts live in sante-prevoyance/full →
+// remboursementsRecents[].montantDuVersement (the amount actually paid to the
+// bank), and there is no full-history reimbursement endpoint.
+const DISCOVERY_MODE = false
 
 // Endpoints we intercept (JSON bodies). Confirmed by recon:
 // - sante-prevoyance/full → contract id (contratsSante[0].identifiant)
@@ -6968,16 +7080,51 @@ class GanContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED_M
     this.log('info', `Found ${documents.length} document(s) to save`)
 
     const files = (0,_parsing__WEBPACK_IMPORTED_MODULE_4__.buildFiles)(documents)
-    if (files.length) {
-      // These are documents (PDF statements), not invoices with an amount, so
-      // saveFiles (not saveBills, which requires `amount`) is the right call.
-      await this.saveFiles(files, {
+
+    // Reimbursements with an amount (the few most recent ones Gan exposes). Each
+    // is turned into an io.cozy.bill linked to the relevé PDF of the same month
+    // so Cozy Banks can reconcile it with the matching bank credit. We fetch the
+    // santé payload if the auth path did not already capture it.
+    const santeFull =
+      this.store?.santeFull ||
+      this.store?.interceptions?.['sante-full']?.response ||
+      (await this.runInWorker(
+        'apiGet',
+        '/api/ecli/bff/hubs/sante-prevoyance/full'
+      ))
+    const reimbursements = (0,_parsing__WEBPACK_IMPORTED_MODULE_4__.parseReimbursements)(santeFull)
+    const bills = (0,_parsing__WEBPACK_IMPORTED_MODULE_4__.buildRefundBills)(reimbursements, documents, files)
+    this.log(
+      'info',
+      `${reimbursements.length} recent reimbursement(s), ${bills.length} linkable to a relevé`
+    )
+
+    // Save the reimbursements as bills (this also saves+links their relevé PDF).
+    if (bills.length) {
+      await this.saveBills(bills, {
         context,
         fileIdAttributes: ['vendorRef'],
         contentType: 'application/pdf',
         qualificationLabel: 'health_invoice'
       })
-    } else {
+    }
+
+    // Save the remaining relevés (those with no matched reimbursement) as plain
+    // files, so every PDF still lands in Drive. Files already saved as a bill's
+    // invoice are skipped here — the file dedup would merge them anyway, but not
+    // re-listing them avoids a needless second download.
+    const billRefs = new Set(bills.map(b => b.vendorRef))
+    const remainingFiles = files.filter(f => !billRefs.has(f.vendorRef))
+    if (remainingFiles.length) {
+      await this.saveFiles(remainingFiles, {
+        context,
+        fileIdAttributes: ['vendorRef'],
+        contentType: 'application/pdf',
+        qualificationLabel: 'health_invoice'
+      })
+    }
+
+    if (!bills.length && !remainingFiles.length) {
       this.log('info', 'No document to save')
     }
   }
@@ -7079,9 +7226,15 @@ class GanContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED_M
       '/api/ecli/bff/hubs/sante-prevoyance/remboursements',
       '/api/ecli/bff/hubs/sante-prevoyance/decomptes',
       '/api/ecli/bff/hubs/sante-prevoyance/prestations',
+      '/api/ecli/bff/hubs/sante-prevoyance/reglements',
+      '/api/ecli/bff/hubs/sante-prevoyance/virements',
+      '/api/ecli/bff/hubs/sante-prevoyance/paiements',
       '/api/ecli/bff/remboursements',
       '/api/ecli/bff/decomptes',
       '/api/ecli/bff/prestations',
+      '/api/ecli/bff/reglements',
+      '/api/ecli/bff/virements',
+      '/api/ecli/bff/paiements',
       '/api/ecli/bff/cotisations',
       '/api/ecli/bff/quittances',
       '/api/ecli/bff/echeances',
