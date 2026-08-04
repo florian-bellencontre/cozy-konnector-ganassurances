@@ -7920,7 +7920,19 @@ class GanContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED_M
         context,
         fileIdAttributes: ['vendorRef'],
         contentType: 'application/pdf',
-        qualificationLabel: 'health_invoice'
+        qualificationLabel: 'health_invoice',
+        // cozy-clisk only updates an existing bill when its invoice changed or
+        // its metadata is incomplete (`defaultShouldUpdate` in saveBills.js).
+        // A bill saved before the fees were reachable would therefore keep no
+        // originalAmount forever, and the care line could never be matched. Ask
+        // for an update whenever we now know something the stored bill does not.
+        shouldUpdate: (entry, dbEntry) =>
+          (entry.originalAmount !== undefined &&
+            dbEntry.originalAmount === undefined) ||
+          (entry.originalDate !== undefined &&
+            dbEntry.originalDate === undefined) ||
+          (entry.matchingCriterias?.dateUpperDelta !== undefined &&
+            dbEntry.matchingCriterias?.dateUpperDelta === undefined)
       })
     }
 
