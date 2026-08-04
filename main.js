@@ -6137,7 +6137,6 @@ microee__WEBPACK_IMPORTED_MODULE_0___default().mixin(RequestInterceptor)
 __webpack_require__.r(__webpack_exports__);
 /* harmony export */ __webpack_require__.d(__webpack_exports__, {
 /* harmony export */   BILL_TYPE: () => (/* binding */ BILL_TYPE),
-/* harmony export */   DETAIL_DATE_UPPER_DELTA: () => (/* binding */ DETAIL_DATE_UPPER_DELTA),
 /* harmony export */   DOC_DOWNLOAD_BASE: () => (/* binding */ DOC_DOWNLOAD_BASE),
 /* harmony export */   GAN_LABEL_REGEX: () => (/* binding */ GAN_LABEL_REGEX),
 /* harmony export */   buildFiles: () => (/* binding */ buildFiles),
@@ -6147,6 +6146,7 @@ __webpack_require__.r(__webpack_exports__);
 /* harmony export */   collectLabelledValues: () => (/* binding */ collectLabelledValues),
 /* harmony export */   collectRoutes: () => (/* binding */ collectRoutes),
 /* harmony export */   dateFromId: () => (/* binding */ dateFromId),
+/* harmony export */   dateUpperDeltaFor: () => (/* binding */ dateUpperDeltaFor),
 /* harmony export */   describeShape: () => (/* binding */ describeShape),
 /* harmony export */   detailPath: () => (/* binding */ detailPath),
 /* harmony export */   enrichWithDetail: () => (/* binding */ enrichWithDetail),
@@ -6724,20 +6724,39 @@ function parseReimbursementDetail(payload) {
   return { fees, careDate }
 }
 
+// cozy-banks' own default upper delta (DEFAULT_DATE_UPPER_DELTA in Linker.js).
+const DEFAULT_UPPER_DELTA = 29
+// The bank credit posts a few days after Gan's versement date; this covers it.
+const CREDIT_POSTING_MARGIN = 15
+// Sanity ceiling, so a garbage care date cannot open a year-wide search.
+const MAX_UPPER_DELTA = 200
+
 /**
- * Widen the DEBIT/CREDIT date window when originalDate is set. Mandatory: the
- * single transaction query window of matchFromBills.js is centred on
- * `originalDate || date`, so a versement paid after the care would fall outside
- * the fetched transactions and the credit link that works today would silently
- * break.
+ * Upper date delta for ONE bill, derived from its own care → payment delay.
  *
- * Sized on real data: the konnector logs the care → payment delay at every sync
- * and the measured values are 5, 6 and 7 days. 45 days leaves a wide margin for a
- * slow reimbursement (paper claim, CPAM processed first) while keeping the debit
- * window tight — every extra day widens the search for a same-amount health
- * expense, and the exact amount is the last guardrail.
+ * Mandatory when originalDate is set: the single transaction query window of
+ * matchFromBills.js is centred on `originalDate || date`, so a versement paid
+ * long after the care falls outside the fetched transactions and the credit link
+ * silently breaks.
+ *
+ * A fixed value cannot work. The 14 delays measured on the instance are 4, 5, 6,
+ * 6, 7, 7, 8, 8, 9, 10, 11, 12 days… and 93 and 164 (late reimbursements). A flat
+ * 45 would have broken those two; a flat 180 would stretch every other bill's
+ * debit search over six months for nothing. So each bill gets just what it needs.
+ *
+ * @param {Date} careDate
+ * @param {Date} paymentDate
+ * @returns {number} days
  */
-const DETAIL_DATE_UPPER_DELTA = 45
+function dateUpperDeltaFor(careDate, paymentDate) {
+  if (!careDate || !paymentDate) return DEFAULT_UPPER_DELTA
+  const delay = daysBetween(careDate, paymentDate)
+  if (!Number.isFinite(delay)) return DEFAULT_UPPER_DELTA
+  return Math.min(
+    MAX_UPPER_DELTA,
+    Math.max(DEFAULT_UPPER_DELTA, delay + CREDIT_POSTING_MARGIN)
+  )
+}
 
 /**
  * Was the versement paid to the insured, or to a third party (the professional,
@@ -6959,7 +6978,7 @@ function buildRefundBills(reimbursements, documents, fileEntries) {
       matchingCriterias: {
         labelRegex: GAN_LABEL_REGEX,
         ...(Number.isFinite(r.fees) && r.careDate
-          ? { dateUpperDelta: DETAIL_DATE_UPPER_DELTA }
+          ? { dateUpperDelta: dateUpperDeltaFor(r.careDate, r.date) }
           : {})
       }
     })
