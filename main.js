@@ -6692,7 +6692,7 @@ const AUTH_HOST = 'authentification.ganassurances.fr'
 // documents carry NO amount ({identifiant, libelle, codeType, isNew,
 // datePublication}), so only the recent reimbursements can become matchable
 // bills — history cannot be reconstructed.
-const DISCOVERY_MODE = false
+const DISCOVERY_MODE = true
 
 // Endpoints we intercept (JSON bodies). Confirmed by recon:
 // - sante-prevoyance/full → contract id (contratsSante[0].identifiant)
