@@ -6143,11 +6143,16 @@ __webpack_require__.r(__webpack_exports__);
 /* harmony export */   buildRefundBills: () => (/* binding */ buildRefundBills),
 /* harmony export */   careToPaymentDelays: () => (/* binding */ careToPaymentDelays),
 /* harmony export */   collectRoutes: () => (/* binding */ collectRoutes),
+/* harmony export */   dateFromId: () => (/* binding */ dateFromId),
 /* harmony export */   describeShape: () => (/* binding */ describeShape),
+/* harmony export */   idFromActionUrl: () => (/* binding */ idFromActionUrl),
 /* harmony export */   maskIds: () => (/* binding */ maskIds),
+/* harmony export */   mergeReimbursements: () => (/* binding */ mergeReimbursements),
 /* harmony export */   monthKey: () => (/* binding */ monthKey),
+/* harmony export */   parseAmount: () => (/* binding */ parseAmount),
 /* harmony export */   parseDocuments: () => (/* binding */ parseDocuments),
 /* harmony export */   parseFrDate: () => (/* binding */ parseFrDate),
+/* harmony export */   parseHistoryReimbursements: () => (/* binding */ parseHistoryReimbursements),
 /* harmony export */   parseReimbursements: () => (/* binding */ parseReimbursements),
 /* harmony export */   shortHash: () => (/* binding */ shortHash),
 /* harmony export */   summarizeJson: () => (/* binding */ summarizeJson)
@@ -6223,6 +6228,22 @@ function describeShape(value, maxDepth = 5, depth = 0) {
   // Primitive: return the type name only (never the value).
   return t
 }
+
+// Lowercase French month names, indexed 0-11 (parseFrDate long form).
+const FR_MONTHS = [
+  'janvier',
+  'février',
+  'mars',
+  'avril',
+  'mai',
+  'juin',
+  'juillet',
+  'août',
+  'septembre',
+  'octobre',
+  'novembre',
+  'décembre'
+]
 
 // Regex (lowercase — cozy-banks lowercases labels before matching) that a Gan
 // health-reimbursement bank credit's label matches, e.g.
@@ -6443,12 +6464,137 @@ function parseReimbursements(santeFull) {
       typeof r.montantDuVersement === 'number'
         ? r.montantDuVersement
         : Number(r.montantDuVersement)
-    const date = parseFrDate(r.dateDuVersement)
+    const id = idFromActionUrl(r.action?.url)
+    const date = parseFrDate(r.dateDuVersement) || dateFromId(id)
     // Only refunds we can actually match: a positive amount and a real date.
     if (!Number.isFinite(amount) || amount <= 0 || !date) continue
-    out.push({ amount, date, careDate: parseFrDate(r.dateDuSoin) })
+    out.push({
+      id,
+      amount,
+      date,
+      careDate: parseFrDate(r.dateDuSoin),
+      destType: r.typeDestinataire || null
+    })
   }
   return out
+}
+
+/**
+ * Parse a FR amount string ("5,40 €", "1 234,56 €") or a number.
+ *
+ * @param {*} value
+ * @returns {number} NaN when unparsable
+ */
+function parseAmount(value) {
+  if (typeof value === 'number') return value
+  if (!value) return NaN
+  const cleaned = String(value)
+    .replace(/[\s\u00a0]/g, '')
+    .replace(/[€]/g, '')
+    .replace(',', '.')
+  return Number(cleaned)
+}
+
+/**
+ * The décompte id embedded in an `action.url`
+ * (/remboursements/{contrat}/remboursement/{id}-{yyyymmdd}).
+ *
+ * @param {*} url
+ * @returns {string|null}
+ */
+function idFromActionUrl(url) {
+  const match = String(url || '').match(/remboursement\/([^/?]+)/)
+  return match ? match[1] : null
+}
+
+/**
+ * The payment date encoded at the end of a décompte id ("…-20260730"). Used as a
+ * fallback when `dateVersement` is in a format we do not parse — the id suffix is
+ * unambiguous, so it makes the history parsing robust to a label change.
+ *
+ * @param {string|null} id
+ * @returns {Date|null}
+ */
+function dateFromId(id) {
+  const match = String(id || '').match(/-(\d{4})(\d{2})(\d{2})$/)
+  if (!match) return null
+  const date = new Date(
+    Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]))
+  )
+  return isNaN(date) ? null : date
+}
+
+/**
+ * Extract the FULL reimbursement history.
+ *
+ * Confirmed endpoint (recovered from this repo's v1.0.x, verified by a recon run
+ * — a direct apiGet works, no need to click through the SPA):
+ *   GET /api/ecli/bff/v1/remboursement/page-remboursements/{contrat}
+ *   → { blocRemboursements: { remboursementsParMois: [ { mois, annee,
+ *         remboursements: [ { action:{url}, dateVersement, beneficiaire,
+ *           libelleRemboursementPar, montant:"5,40 €", libelleEffectueA,
+ *           partieAyantRecu, typeDestinataire } ] } ],
+ *       paginationWeb, paginationMobile } }
+ *
+ * Unlike the dashboard widget (`remboursementsRecents`, 3 items) this covers
+ * every versement — which is what makes the past reimbursements matchable at
+ * all. It carries NO care date and NO fees, so bills built from it can only
+ * match the bank credit, not the health expense.
+ *
+ * Only amount, date, id and the destinataire TYPE are kept: no beneficiary or
+ * payee name ever leaves this function.
+ *
+ * @param {*} payload
+ * @returns {Array<{id:(string|null), amount:number, date:Date, careDate:null,
+ *                  destType:(string|null)}>}
+ */
+function parseHistoryReimbursements(payload) {
+  const groups = payload?.blocRemboursements?.remboursementsParMois
+  if (!Array.isArray(groups)) return []
+  const out = []
+  for (const group of groups) {
+    for (const raw of group?.remboursements || []) {
+      if (!raw || typeof raw !== 'object') continue
+      const id = idFromActionUrl(raw.action?.url)
+      const amount = parseAmount(raw.montant)
+      const date = parseFrDate(raw.dateVersement) || dateFromId(id)
+      if (!Number.isFinite(amount) || amount <= 0 || !date) continue
+      out.push({
+        id,
+        amount,
+        date,
+        careDate: null,
+        destType: raw.typeDestinataire || null
+      })
+    }
+  }
+  return out
+}
+
+/**
+ * Merge the full history with the dashboard's recent list, keyed on the décompte
+ * id (falling back to date+amount). The history is exhaustive but has no care
+ * date; the recent list has `dateDuSoin`. Merging keeps the best of both.
+ *
+ * @param {Array<object>} history
+ * @param {Array<object>} recent
+ * @returns {Array<object>} newest first
+ */
+function mergeReimbursements(history, recent) {
+  const keyOf = r =>
+    r.id || `${r.date ? r.date.toISOString().slice(0, 10) : '?'}-${r.amount}`
+  const byKey = new Map()
+  for (const r of history) byKey.set(keyOf(r), { ...r })
+  for (const r of recent) {
+    const key = keyOf(r)
+    const known = byKey.get(key)
+    if (known) {
+      if (!known.careDate && r.careDate) known.careDate = r.careDate
+    } else {
+      byKey.set(key, { ...r })
+    }
+  }
+  return [...byKey.values()].sort((a, b) => b.date - a.date)
 }
 
 /**
@@ -6626,6 +6772,17 @@ function parseFrDate(value) {
     const d = new Date(Date.UTC(Number(m[3]), Number(m[2]) - 1, Number(m[1])))
     return isNaN(d) ? null : d
   }
+  // Long French form, as displayed on the site ("30 juillet 2026"): the
+  // reimbursement history may label its dates this way, and `new Date()` cannot
+  // parse it.
+  const long = str.toLowerCase().match(/^(\d{1,2})\s+([a-zéûî]+)\s+(\d{4})$/)
+  if (long) {
+    const month = FR_MONTHS.indexOf(long[2])
+    if (month >= 0) {
+      const d = new Date(Date.UTC(Number(long[3]), month, Number(long[1])))
+      return isNaN(d) ? null : d
+    }
+  }
   const fallback = new Date(str)
   return isNaN(fallback) ? null : fallback
 }
@@ -6737,14 +6894,21 @@ const BASE_URL = 'https://espaceclient.ganassurances.fr'
 const AUTH_HOST = 'authentification.ganassurances.fr'
 
 // Set to true only to re-map the API (logs every JSON endpoint + shapes) when
-// Gan changes its site. Normal operation is false. Confirmed by the last
-// reconnaissance run: reimbursement amounts live in sante-prevoyance/full →
-// remboursementsRecents[].montantDuVersement (the amount actually paid to the
-// bank), and there is no full-history reimbursement endpoint. Confirmed: relevé
-// documents carry NO amount ({identifiant, libelle, codeType, isNew,
-// datePublication}), so only the recent reimbursements can become matchable
-// bills — history cannot be reconstructed.
-const DISCOVERY_MODE = true
+// Gan changes its site. Normal operation is false.
+//
+// State of the map, all verified by recon runs:
+// - sante-prevoyance/full → contract id + `remboursementsRecents` (3 latest,
+//   with `dateDuSoin`). This widget is NOT the whole story.
+// - v1/remboursement/page-remboursements/{contrat} → the FULL history, grouped
+//   by month, with `montant` and `dateVersement` but no care date and no fees.
+// - relevé documents carry no amount in their metadata ({identifiant, libelle,
+//   codeType, isNew, datePublication}) — only inside the PDF itself.
+// - the fees ("Total 30,00 €" next to "Gan 9,00 €" on the détail screen) are the
+//   last missing piece, and its endpoint is STILL unknown: five candidate paths
+//   under v1/remboursement/ answer 404, and the `/front/` pages do not boot in
+//   the konnector webview (0 XHR, empty DOM), so no interception is possible.
+//   The remaining lead is the site's own JS bundle, only readable authenticated.
+const DISCOVERY_MODE = false
 
 // Endpoints we intercept (JSON bodies). Confirmed by recon:
 // - sante-prevoyance/full → contract id (contratsSante[0].identifiant)
@@ -7381,11 +7545,43 @@ class GanContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED_M
         'apiGet',
         '/api/ecli/bff/hubs/sante-prevoyance/full'
       ))
-    const reimbursements = (0,_parsing__WEBPACK_IMPORTED_MODULE_4__.parseReimbursements)(santeFull)
+    const recent = (0,_parsing__WEBPACK_IMPORTED_MODULE_4__.parseReimbursements)(santeFull)
+
+    // The FULL history, from the endpoint the reimbursement list page uses. This
+    // is what makes past versements matchable at all — the dashboard widget only
+    // ever exposes the 3 latest. Confirmed working through a direct apiGet.
+    let history = []
+    const contractId = this.getSanteContractId()
+    if (contractId) {
+      const payload = await this.runInWorker(
+        'apiGet',
+        `/api/ecli/bff/v1/remboursement/page-remboursements/${contractId}`
+      )
+      history = (0,_parsing__WEBPACK_IMPORTED_MODULE_4__.parseHistoryReimbursements)(payload)
+      this.log(
+        'info',
+        `history: ${history.length} reimbursement(s) over ${
+          payload?.blocRemboursements?.remboursementsParMois?.length || 0
+        } month(s), paginationWeb=${payload?.blocRemboursements?.paginationWeb}`
+      )
+    }
+
+    // History is exhaustive but carries no care date; the recent list carries it.
+    const reimbursements = (0,_parsing__WEBPACK_IMPORTED_MODULE_4__.mergeReimbursements)(history, recent)
+    // Destinataire TYPES only (enum codes, no name): a versement paid to the
+    // professional is tiers payant, never lands on the bank account, and should
+    // eventually be flagged isThirdPartyPayer instead of being left unmatchable.
+    const destTypes = [
+      ...new Set(reimbursements.map(r => r.destType).filter(Boolean))
+    ]
+    if (destTypes.length) {
+      this.log('info', `destinataire types seen: ${destTypes.join(', ')}`)
+    }
+
     const bills = (0,_parsing__WEBPACK_IMPORTED_MODULE_4__.buildRefundBills)(reimbursements, documents, files)
     this.log(
       'info',
-      `${reimbursements.length} recent reimbursement(s), ${bills.length} linkable to a relevé`
+      `${reimbursements.length} reimbursement(s) known, ${bills.length} linkable to a relevé`
     )
 
     // Days between the care and the payment — days only, no amount, no name.
