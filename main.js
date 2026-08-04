@@ -6161,6 +6161,7 @@ __webpack_require__.r(__webpack_exports__);
 /* harmony export */   parseHistoryReimbursements: () => (/* binding */ parseHistoryReimbursements),
 /* harmony export */   parseReimbursementDetail: () => (/* binding */ parseReimbursementDetail),
 /* harmony export */   parseReimbursements: () => (/* binding */ parseReimbursements),
+/* harmony export */   roundCents: () => (/* binding */ roundCents),
 /* harmony export */   shortHash: () => (/* binding */ shortHash),
 /* harmony export */   summarizeJson: () => (/* binding */ summarizeJson)
 /* harmony export */ });
@@ -6487,6 +6488,19 @@ function parseReimbursements(santeFull) {
 }
 
 /**
+ * Round to cents. Gan returns raw floats — one détail total came back as
+ * 23.040000000000003 — and money has no business carrying that noise in a
+ * document. Harmless for the matching (byAmounts tolerates ±0.001) but the
+ * stored value should be exact.
+ *
+ * @param {number} value
+ * @returns {number}
+ */
+function roundCents(value) {
+  return Number.isFinite(value) ? Math.round(value * 100) / 100 : value
+}
+
+/**
  * Parse a FR amount string ("5,40 €", "1 234,56 €") or a number.
  *
  * @param {*} value
@@ -6499,7 +6513,7 @@ function parseAmount(value) {
     .replace(/[\s\u00a0]/g, '')
     .replace(/[€]/g, '')
     .replace(',', '.')
-  return Number(cleaned)
+  return roundCents(Number(cleaned))
 }
 
 /**
@@ -6801,7 +6815,7 @@ function enrichWithDetail(reimbursement, detail) {
     fees > 0 &&
     fees >= enriched.amount - 0.001 &&
     fees <= enriched.amount * 50
-  if (coherent) enriched.fees = fees
+  if (coherent) enriched.fees = roundCents(fees)
   return enriched
 }
 
