@@ -7920,20 +7920,35 @@ class GanContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED_M
         context,
         fileIdAttributes: ['vendorRef'],
         contentType: 'application/pdf',
-        qualificationLabel: 'health_invoice',
-        // cozy-clisk only updates an existing bill when its invoice changed or
-        // its metadata is incomplete (`defaultShouldUpdate` in saveBills.js).
-        // A bill saved before the fees were reachable would therefore keep no
-        // originalAmount forever, and the care line could never be matched. Ask
-        // for an update whenever we now know something the stored bill does not.
-        shouldUpdate: (entry, dbEntry) =>
-          (entry.originalAmount !== undefined &&
-            dbEntry.originalAmount === undefined) ||
-          (entry.originalDate !== undefined &&
-            dbEntry.originalDate === undefined) ||
-          (entry.matchingCriterias?.dateUpperDelta !== undefined &&
-            dbEntry.matchingCriterias?.dateUpperDelta === undefined)
+        qualificationLabel: 'health_invoice'
+        // No `shouldUpdate` here, and it is NOT an omission: options cross the
+        // pilot→launcher bridge through JSON.stringify
+        // (ContentScriptMessenger.postMessage), so a function property is
+        // silently dropped and the launcher falls back to its own
+        // `defaultShouldUpdate`. That default only updates a bill whose invoice
+        // changed or whose metadata is incomplete, so a bill saved before the
+        // fees were reachable keeps no originalAmount — and no serializable
+        // option can change that. New versements are created complete; the ones
+        // already stored need the one-shot patch built from the log below.
       })
+
+      // One-shot migration material: what SHOULD be stored on each bill, keyed by
+      // date|amount so an existing document can be patched server-side. Logged
+      // only for the bills that carry fees, and only until they all do.
+      const patch = {}
+      for (const bill of bills) {
+        if (!Number.isFinite(bill.originalAmount) || !bill.originalDate)
+          continue
+        const key = `${bill.date.toISOString().slice(0, 10)}|${bill.amount}`
+        patch[key] = {
+          originalAmount: bill.originalAmount,
+          originalDate: bill.originalDate.toISOString().slice(0, 10),
+          dateUpperDelta: bill.matchingCriterias.dateUpperDelta
+        }
+      }
+      if (Object.keys(patch).length) {
+        this.log('info', `bill patch → ${JSON.stringify(patch)}`)
+      }
     }
 
     // Save the remaining relevés (those with no matched reimbursement) as plain
