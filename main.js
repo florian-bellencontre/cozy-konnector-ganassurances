@@ -6144,6 +6144,7 @@ __webpack_require__.r(__webpack_exports__);
 /* harmony export */   buildRefundBills: () => (/* binding */ buildRefundBills),
 /* harmony export */   careToPaymentDelays: () => (/* binding */ careToPaymentDelays),
 /* harmony export */   collectAmounts: () => (/* binding */ collectAmounts),
+/* harmony export */   collectLabelledValues: () => (/* binding */ collectLabelledValues),
 /* harmony export */   collectRoutes: () => (/* binding */ collectRoutes),
 /* harmony export */   dateFromId: () => (/* binding */ dateFromId),
 /* harmony export */   describeShape: () => (/* binding */ describeShape),
@@ -6638,8 +6639,36 @@ const FEE_KEY_PATTERNS = [
   /depense|dépense|montantEngage/i
 ]
 
-// Key names that carry the care date.
+// Key names that carry the care date, when the payload names its fields.
 const CARE_DATE_KEY_PATTERN = /^date(Du)?Soins?$/i
+
+// …but the détail payload does not: it ships generic label/value pairs
+// (`blocDetailRemboursement.champs[] = {libelle, valeur, type}`), so the care
+// date has to be found by its LABEL. Confirmed on the instance, which is why the
+// first version found the fees for 14/14 décomptes and no care date at all.
+const CARE_DATE_LABEL_PATTERN = /date\s+du\s+soin/i
+
+/**
+ * Every {libelle, valeur} pair in a payload, at any depth. Gan's détail screen
+ * describes itself that way (« Date du soin » → « 23 juillet 2026 »), so the
+ * meaning is in the label, not in the key.
+ *
+ * @param {*} value
+ * @param {Array<{libelle:string, valeur:*}>} [out]
+ * @returns {Array<{libelle:string, valeur:*}>}
+ */
+function collectLabelledValues(value, out = []) {
+  if (!value || typeof value !== 'object') return out
+  if (Array.isArray(value)) {
+    for (const item of value) collectLabelledValues(item, out)
+    return out
+  }
+  if (typeof value.libelle === 'string' && value.valeur !== undefined) {
+    out.push({ libelle: value.libelle, valeur: value.valeur })
+  }
+  for (const key of Object.keys(value)) collectLabelledValues(value[key], out)
+  return out
+}
 
 /**
  * Read the fees and the care date out of a décompte detail payload.
@@ -6669,20 +6698,28 @@ function parseReimbursementDetail(payload) {
     }
   }
 
+  // Care date, by label first (that is how Gan ships it) then by key name.
   let careDate = null
-  const walk = (value, key) => {
-    if (careDate || value === null || value === undefined) return
-    if (Array.isArray(value)) {
-      for (const item of value) walk(item, key)
-      return
+  const labelled = collectLabelledValues(payload).find(pair =>
+    CARE_DATE_LABEL_PATTERN.test(pair.libelle)
+  )
+  if (labelled) careDate = parseFrDate(labelled.valeur)
+
+  if (!careDate) {
+    const walk = (value, key) => {
+      if (careDate || value === null || value === undefined) return
+      if (Array.isArray(value)) {
+        for (const item of value) walk(item, key)
+        return
+      }
+      if (typeof value === 'object') {
+        for (const k of Object.keys(value)) walk(value[k], k)
+        return
+      }
+      if (CARE_DATE_KEY_PATTERN.test(key)) careDate = parseFrDate(value)
     }
-    if (typeof value === 'object') {
-      for (const k of Object.keys(value)) walk(value[k], k)
-      return
-    }
-    if (CARE_DATE_KEY_PATTERN.test(key)) careDate = parseFrDate(value)
+    walk(payload, '')
   }
-  walk(payload, '')
 
   return { fees, careDate }
 }
