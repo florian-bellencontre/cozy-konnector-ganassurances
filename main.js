@@ -7207,12 +7207,25 @@ class GanContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED_M
           await this.goto(BASE_URL + detailUrl)
           await this.waitForElementInWorker('body', {})
           await this.wait(6000)
-          await this.dumpApiShapes()
         } catch (err) {
           this.log('warn', `🔬 décompte detail: ${err.message}`)
         }
       } else {
         this.log('info', '🔬 no action.url on the most recent reimbursement')
+      }
+
+      // The portal DOES show the full reimbursement history (user-confirmed), so
+      // an endpoint serves it — `remboursementsRecents` is only the dashboard
+      // widget. Walk the santé section and its "Mes remboursements" sub-tabs so
+      // the interceptor records the real URLs, then dump every seen endpoint.
+      // A history endpoint carrying the fees would unlock BOTH the past
+      // reimbursements and the debit matching.
+      try {
+        await this.goto(BASE_URL)
+        await this.waitForElementInWorker('body', {})
+        await this.runDiscovery()
+      } catch (err) {
+        this.log('warn', `🔬 walk: ${err.message}`)
       }
       return
     }
