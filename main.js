@@ -6142,7 +6142,9 @@ __webpack_require__.r(__webpack_exports__);
 /* harmony export */   buildFiles: () => (/* binding */ buildFiles),
 /* harmony export */   buildRefundBills: () => (/* binding */ buildRefundBills),
 /* harmony export */   careToPaymentDelays: () => (/* binding */ careToPaymentDelays),
+/* harmony export */   collectRoutes: () => (/* binding */ collectRoutes),
 /* harmony export */   describeShape: () => (/* binding */ describeShape),
+/* harmony export */   maskIds: () => (/* binding */ maskIds),
 /* harmony export */   monthKey: () => (/* binding */ monthKey),
 /* harmony export */   parseDocuments: () => (/* binding */ parseDocuments),
 /* harmony export */   parseFrDate: () => (/* binding */ parseFrDate),
@@ -6234,6 +6236,56 @@ const GAN_LABEL_REGEX = '(groupama gan|gan vie|gan assurance)'
 // pairs with a health transaction, and it is CONFIRMED working on the instance:
 // the bill does show up on the Gan reimbursement credit. Do not change it.
 const BILL_TYPE = 'health_costs'
+
+/**
+ * Mask long digit runs (contract numbers, décompte ids) in any string so recon
+ * logs can be pasted around without carrying identifiers. Short numbers (v1,
+ * v2…) are kept, they carry meaning.
+ *
+ * @param {string} str
+ * @returns {string}
+ */
+function maskIds(str) {
+  return String(str).replace(/\d{4,}/g, '<id>')
+}
+
+/**
+ * Collect the SPA routes advertised by the API payloads (menu, header, synthèse,
+ * hub…), health-related ones first. Guessing endpoint paths failed — every guess
+ * 404s — so the reliable way to reach a page is to use the routes the site
+ * itself publishes.
+ *
+ * Note the real routes are prefixed with `/front/` (confirmed:
+ * /front/remboursements/<contrat> lists every reimbursement) whereas
+ * `remboursementsRecents[].action.url` omits it, which is why loading that url
+ * verbatim renders nothing.
+ *
+ * @param {Array<*>} payloads
+ * @returns {Array<string>} unique routes, health/reimbursement ones first
+ */
+function collectRoutes(payloads) {
+  const found = new Set()
+  const walk = value => {
+    if (!value) return
+    if (typeof value === 'string') {
+      if (/^(\/|https?:\/\/[^/]*ganassurances)/.test(value)) found.add(value)
+      return
+    }
+    if (typeof value !== 'object') return
+    for (const key of Object.keys(value)) walk(value[key])
+  }
+  payloads.forEach(walk)
+
+  const routes = [...found]
+    // API endpoints and assets are not pages.
+    .filter(
+      r => !/^\/api\//.test(r) && !/\.(png|jpe?g|svg|css|js|pdf)$/i.test(r)
+    )
+    .map(r => (/^\/front\//.test(r) ? r : r.replace(/^\//, '/front/')))
+  const isHealth = r =>
+    /rembours|sante|santé|decompte|décompte|prestation|soin/i.test(r)
+  return [...routes.filter(isHealth), ...routes.filter(r => !isHealth(r))]
+}
 
 // Base download URL for a document (a real PDF). The document `identifiant`
 // (a JWT) is appended, plus the `/pdf?print=false` suffix. Confirmed via
@@ -7185,48 +7237,122 @@ class GanContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED_M
         `🔬 REMB0 → ${JSON.stringify((0,_parsing__WEBPACK_IMPORTED_MODULE_4__.describeShape)(firstRemb, 8))}`
       )
 
-      // Does the décompte DETAIL expose the amount actually paid to the health
-      // professional (les « frais réels ») and the care date? That is the only
-      // missing piece to also match the health expense DEBIT in Cozy Banks —
-      // i.e. to get « Remboursé » on the care line itself instead of just a
-      // receipt on the credit line (a bill needs originalAmount + originalDate
-      // for the debit search; `remboursementsRecents` has neither).
-      // `action.url` is an SPA route: open it so the page fires its own API
-      // calls, then dump their shapes.
-      const detailUrl = firstRemb?.action?.url
-      if (detailUrl) {
-        // Ids are masked: the route carries contract/décompte numbers.
+      const contractId = this.getSanteContractId()
+
+      // FULL HISTORY — endpoint recovered from this repo's own v1.0.x history,
+      // dropped by the "collecte via API directe" refactor and forgotten since:
+      //   GET /api/ecli/bff/v1/remboursement/page-remboursements/{contrat}
+      //   → blocRemboursements.remboursementsParMois[].remboursements[]
+      //       { dateVersement, montant:"5,40 €", partieAyantRecu, beneficiaire,
+      //         libelleRemboursementPar, action:{url} }
+      // It returns EVERY reimbursement grouped by month, which invalidates the
+      // "only 3 versements are exposed" conclusion drawn from the dashboard
+      // widget. The old code clicked the link and intercepted the XHR, assuming
+      // a direct GET would not work — worth testing, apiGet works elsewhere.
+      if (contractId) {
+        const history = await this.runInWorker(
+          'apiGet',
+          `/api/ecli/bff/v1/remboursement/page-remboursements/${contractId}`
+        )
         this.log(
           'info',
-          `🔬 opening décompte detail ${String(detailUrl).replace(
-            /\d+/g,
-            '<id>'
-          )}`
+          `🔬 HISTORY → ${
+            history && typeof history === 'object'
+              ? JSON.stringify((0,_parsing__WEBPACK_IMPORTED_MODULE_4__.describeShape)(history, 7))
+              : '(no JSON / not accessible)'
+          }`
         )
-        try {
-          await this.goto(BASE_URL + detailUrl)
-          await this.waitForElementInWorker('body', {})
-          await this.wait(6000)
-        } catch (err) {
-          this.log('warn', `🔬 décompte detail: ${err.message}`)
+      }
+
+      // The per-décompte FEES are not in that list: they are on the detail
+      // screen ("Total 30,00 €" = frais réels, the missing originalAmount).
+      // Guess a few detail endpoints on the same prefix, built from the real
+      // décompte id carried by action.url.
+      const decompteId = String(firstRemb?.action?.url || '').match(
+        /remboursement\/([^/?]+)/
+      )?.[1]
+      if (contractId && decompteId) {
+        const base = '/api/ecli/bff/v1/remboursement'
+        for (const path of [
+          `${base}/detail-remboursement/${contractId}/${decompteId}`,
+          `${base}/page-remboursement/${contractId}/${decompteId}`,
+          `${base}/${contractId}/remboursement/${decompteId}`,
+          `${base}/detail/${decompteId}`,
+          `${base}/${decompteId}`
+        ]) {
+          const body = await this.runInWorker('apiGet', path)
+          this.log(
+            'info',
+            `🔬 DETAIL TRY ${(0,_parsing__WEBPACK_IMPORTED_MODULE_4__.maskIds)(path)} → ${
+              body && typeof body === 'object'
+                ? JSON.stringify((0,_parsing__WEBPACK_IMPORTED_MODULE_4__.describeShape)(body, 7))
+                : '(no JSON / not accessible)'
+            }`
+          )
         }
+      }
+
+      // The routes the SPA itself knows about. Guessing endpoint paths was a
+      // dead end (every guess 404s), and scanNavigation found nothing on a
+      // deep-loaded route — so read the navigation FROM the API instead. These
+      // payloads carry feature codes and routes, no personal data; long digit
+      // runs (contract / décompte ids) are masked anyway.
+      const [menu, header, synthese] = [
+        await this.runInWorker('apiGet', '/api/ecli/bff/v1/menu'),
+        await this.runInWorker(
+          'apiGet',
+          '/api/ecli/navigation/header?onglet=main'
+        ),
+        await this.runInWorker('apiGet', '/api/ecli/bff/synthese/preview')
+      ]
+      this.log('info', `🔬 MENU → ${(0,_parsing__WEBPACK_IMPORTED_MODULE_4__.maskIds)(JSON.stringify(menu))}`)
+      this.log('info', `🔬 HEADER → ${(0,_parsing__WEBPACK_IMPORTED_MODULE_4__.maskIds)(JSON.stringify(header))}`)
+      this.log(
+        'info',
+        `🔬 HUB ITEMS → ${(0,_parsing__WEBPACK_IMPORTED_MODULE_4__.maskIds)(
+          JSON.stringify({
+            availableItems: fullPayload?.availableItems,
+            availableActions: fullPayload?.availableActions,
+            contratDetail: fullPayload?.contratsSante?.[0]?.lienDetail?.url
+          })
+        )}`
+      )
+
+      const detailUrl = firstRemb?.action?.url
+      // Confirmed: /front/remboursements/<contrat> lists EVERY reimbursement and
+      // /front/remboursements/<contrat>/remboursement/<id> shows one décompte
+      // with its fees. Note the `/front/` prefix, absent from action.url — which
+      // is why loading action.url verbatim rendered an empty page last run.
+      const routes = (0,_parsing__WEBPACK_IMPORTED_MODULE_4__.collectRoutes)([
+        contractId ? `/front/remboursements/${contractId}` : null,
+        menu,
+        header,
+        synthese,
+        fullPayload
+      ])
+      this.log('info', `🔬 ROUTES → ${(0,_parsing__WEBPACK_IMPORTED_MODULE_4__.maskIds)(JSON.stringify(routes))}`)
+
+      // Visit each route and report which API calls IT triggered — that mapping
+      // is what identifies the reimbursement-history endpoint. `goto` resolves
+      // before the SPA settles, hence the explicit wait on the location change
+      // (the previous run read the URL too early and mapped the wrong page).
+      for (const route of routes.slice(0, 6)) {
+        await this.visitAndReport(route)
+      }
+
+      if (detailUrl) {
+        await this.visitAndReport(detailUrl)
+        // Are the fees in the rendered page even if no clean endpoint serves
+        // them? Report only WHICH labels are present and how many amounts —
+        // never an amount itself.
+        const probe = await this.runInWorker('probeFeeLabels')
+        this.log('info', `🔬 DETAIL DOM → ${JSON.stringify(probe)}`)
       } else {
         this.log('info', '🔬 no action.url on the most recent reimbursement')
       }
 
-      // The portal DOES show the full reimbursement history (user-confirmed), so
-      // an endpoint serves it — `remboursementsRecents` is only the dashboard
-      // widget. Walk the santé section and its "Mes remboursements" sub-tabs so
-      // the interceptor records the real URLs, then dump every seen endpoint.
-      // A history endpoint carrying the fees would unlock BOTH the past
-      // reimbursements and the debit matching.
-      try {
-        await this.goto(BASE_URL)
-        await this.waitForElementInWorker('body', {})
-        await this.runDiscovery()
-      } catch (err) {
-        this.log('warn', `🔬 walk: ${err.message}`)
-      }
+      await this.dumpApiShapes()
+      this.log('info', '🔬 DISCOVERY done — send me every 🔬 line above.')
       return
     }
 
@@ -7385,6 +7511,71 @@ class GanContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED_M
   }
 
   /**
+   * Open one SPA route and report which API calls IT triggered — that per-page
+   * mapping is what identifies the endpoint behind a screen. `goto` resolves
+   * before the SPA settles, so the location is polled until it actually changed
+   * (reading it too early is what made the previous run map the wrong page).
+   *
+   * @param {string} route - a path (with or without leading slash) or full url
+   */
+  async visitAndReport(route) {
+    const seen = () => this.store?.seenApiUrls || []
+    const before = new Set(seen())
+    const url = /^https?:\/\//.test(route) ? route : BASE_URL + route
+    const target = String(route).split('?')[0]
+    try {
+      await this.goto(url)
+      await this.waitForElementInWorker('body', {})
+      for (let i = 0; i < 20; i++) {
+        const href = await this.evaluateInWorker(() => document.location.href)
+        if (href && href.includes(target)) break
+        await this.wait(500)
+      }
+      // Let the SPA fire its own XHR calls.
+      await this.wait(6000)
+    } catch (err) {
+      this.log('warn', `🔬 PAGE ${(0,_parsing__WEBPACK_IMPORTED_MODULE_4__.maskIds)(route)}: ${err.message}`)
+    }
+    const added = seen().filter(u => !before.has(u))
+    this.log(
+      'info',
+      `🔬 PAGE ${(0,_parsing__WEBPACK_IMPORTED_MODULE_4__.maskIds)(route)} → ${added.length} new call(s) ${(0,_parsing__WEBPACK_IMPORTED_MODULE_4__.maskIds)(
+        JSON.stringify(added)
+      )}`
+    )
+  }
+
+  /**
+   * Worker method: does the rendered page carry the fee breakdown? Reports only
+   * WHICH labels are present and HOW MANY amounts are on screen — never an
+   * amount, a name or a date. Confirmed page content: "Total", "Gan",
+   * "Assurance maladie", "Reste à charge", "Date du soin", "Détail des actes".
+   *
+   * @returns {Promise<object>}
+   */
+  async probeFeeLabels() {
+    const text = (document.body?.innerText || '').toLowerCase()
+    const labels = [
+      'total',
+      'gan',
+      'assurance maladie',
+      'reste à charge',
+      'date du soin',
+      'date du remboursement',
+      'détail des actes',
+      'bénéficiaire',
+      'paiement effectué à',
+      'frais réels',
+      'base de remboursement'
+    ]
+    return {
+      textLength: text.length,
+      found: labels.filter(label => text.includes(label)),
+      amountCount: (text.match(/\d+[.,]\d{2}\s*€/g) || []).length
+    }
+  }
+
+  /**
    * Re-fetch each seen (and a few guessed) GET /api/ endpoint and log its
    * PII-safe structural description. Amounts/dates/beneficiaries are located by
    * their KEY NAMES here — no value is ever logged.
@@ -7519,6 +7710,7 @@ connector
       'checkWafRejected',
       'fillLoginForm',
       'scanNavigation',
+      'probeFeeLabels',
       'apiGet',
       'waitForLoginField'
     ]
