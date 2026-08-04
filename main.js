@@ -6136,10 +6136,12 @@ microee__WEBPACK_IMPORTED_MODULE_0___default().mixin(RequestInterceptor)
 "use strict";
 __webpack_require__.r(__webpack_exports__);
 /* harmony export */ __webpack_require__.d(__webpack_exports__, {
+/* harmony export */   BILL_TYPE: () => (/* binding */ BILL_TYPE),
 /* harmony export */   DOC_DOWNLOAD_BASE: () => (/* binding */ DOC_DOWNLOAD_BASE),
 /* harmony export */   GAN_LABEL_REGEX: () => (/* binding */ GAN_LABEL_REGEX),
 /* harmony export */   buildFiles: () => (/* binding */ buildFiles),
 /* harmony export */   buildRefundBills: () => (/* binding */ buildRefundBills),
+/* harmony export */   careToPaymentDelays: () => (/* binding */ careToPaymentDelays),
 /* harmony export */   describeShape: () => (/* binding */ describeShape),
 /* harmony export */   monthKey: () => (/* binding */ monthKey),
 /* harmony export */   parseDocuments: () => (/* binding */ parseDocuments),
@@ -6198,7 +6200,8 @@ function summarizeJson(json) {
  * @returns {*} a nested {key: 'type'} structure, JSON-stringifiable
  */
 function describeShape(value, maxDepth = 5, depth = 0) {
-  if (value === null || value === undefined) return value === null ? 'null' : 'undefined'
+  if (value === null || value === undefined)
+    return value === null ? 'null' : 'undefined'
   if (Array.isArray(value)) {
     if (value.length === 0) return 'Array(0)'
     return {
@@ -6226,6 +6229,11 @@ function describeShape(value, maxDepth = 5, depth = 0) {
 // transaction WITHOUT relying on its internal brands dictionary (which does not
 // know Gan) or the apps registry. Keep in sync with manifest banksTransactionRegExp.
 const GAN_LABEL_REGEX = '(groupama gan|gan vie|gan assurance)'
+
+// `type` set on every bill. 'health_costs' is what cozy-banks' byCategory filter
+// pairs with a health transaction, and it is CONFIRMED working on the instance:
+// the bill does show up on the Gan reimbursement credit. Do not change it.
+const BILL_TYPE = 'health_costs'
 
 // Base download URL for a document (a real PDF). The document `identifiant`
 // (a JWT) is appended, plus the `/pdf?print=false` suffix. Confirmed via
@@ -6359,15 +6367,18 @@ function monthKey(date) {
  * (`remboursementsRecents`), each carrying the amount actually paid to the bank
  * account — which is exactly what a bank credit shows.
  *
- * We keep ONLY the amount and the payment date: no beneficiary / care date /
- * recipient name is ever propagated to a bill (privacy + health data).
+ * We keep the amount, the payment date and the care date. Only the first two
+ * ever reach a bill; `careDate` stays internal — it is used to log the
+ * care → payment delay (a number of days, nothing else) and would become
+ * `originalDate` if the fees paid to the professional ever become available. No
+ * beneficiary / recipient name is ever propagated anywhere.
  *
  * Real shape (GET /api/ecli/bff/hubs/sante-prevoyance/full):
  *   remboursementsRecents: [ { montantDuVersement:number, dateDuVersement:string,
  *     dateDuSoin, destinataireDuPaiement, beneficiaireDesSoins, action } ]
  *
  * @param {*} santeFull
- * @returns {Array<{amount:number, date:Date}>}
+ * @returns {Array<{amount:number, date:Date, careDate:(Date|null)}>}
  */
 function parseReimbursements(santeFull) {
   if (!santeFull || typeof santeFull !== 'object') return []
@@ -6383,17 +6394,80 @@ function parseReimbursements(santeFull) {
     const date = parseFrDate(r.dateDuVersement)
     // Only refunds we can actually match: a positive amount and a real date.
     if (!Number.isFinite(amount) || amount <= 0 || !date) continue
-    out.push({ amount, date })
+    out.push({ amount, date, careDate: parseFrDate(r.dateDuSoin) })
   }
   return out
 }
 
 /**
+ * Delay in days between the care and the payment, for the reimbursements that
+ * expose a care date. Logged at every sync (days only — no amount, no name):
+ * this is the figure that must size `matchingCriterias.dateUpperDelta` the day
+ * `originalDate` is set. See the warning in buildRefundBills.
+ *
+ * @param {Array<{date:Date, careDate:(Date|null)}>} reimbursements
+ * @returns {Array<number>}
+ */
+function careToPaymentDelays(reimbursements) {
+  return reimbursements
+    .filter(r => r.careDate)
+    .map(r => daysBetween(r.careDate, r.date))
+}
+
+// A versement is attached to a relevé at most this far apart (in days) when no
+// relevé of its own month exists. Two months minus a margin: enough to catch a
+// décompte published in the following statement, small enough never to attach a
+// wildly unrelated PDF.
+const MAX_RELEVE_GAP_DAYS = 62
+
+/** Whole days between two Dates (b - a). */
+function daysBetween(a, b) {
+  return Math.round((b.getTime() - a.getTime()) / 86400000)
+}
+
+/**
+ * Index of the relevé PDF to attach to a versement, or undefined if none is
+ * close enough. Preference order:
+ *   1. a relevé published in the SAME calendar month as the payment;
+ *   2. else the FIRST relevé published after it — a décompte paid at the end of
+ *      a month usually lands in the next monthly statement;
+ *   3. else the LAST one published before it.
+ * (2) and (3) are bounded by MAX_RELEVE_GAP_DAYS.
+ *
+ * Only requiring the same month used to drop matchable versements outright
+ * (observed: "3 recent reimbursement(s), 2 linkable to a relevé"), and a dropped
+ * bill means no bank matching at all — saveBills refuses a bill with no file.
+ *
+ * @param {Array<{index:number, date:Date}>} dated - relevés with a date, sorted
+ *                                                   by ascending date
+ * @param {Date} date - the versement date
+ * @returns {number|undefined}
+ */
+function pickReleveIndex(dated, date) {
+  const sameMonth = dated.find(d => monthKey(d.date) === monthKey(date))
+  if (sameMonth) return sameMonth.index
+
+  const after = dated.find(d => daysBetween(date, d.date) >= 0)
+  if (after && daysBetween(date, after.date) <= MAX_RELEVE_GAP_DAYS) {
+    return after.index
+  }
+
+  const before = [...dated].reverse().find(d => daysBetween(d.date, date) >= 0)
+  if (before && daysBetween(before.date, date) <= MAX_RELEVE_GAP_DAYS) {
+    return before.index
+  }
+
+  return undefined
+}
+
+/**
  * Build `io.cozy.bills` entries for the reimbursements, each linked to the
- * monthly relevé PDF of the same month. cozy-clisk's saveBills downloads the
- * file then links the bill, and DROPS any bill without an associated file — so
- * a reimbursement whose month has no relevé yet is intentionally skipped (it
- * will link on a later sync once the relevé is published).
+ * closest monthly relevé PDF (see pickReleveIndex). cozy-clisk's saveBills
+ * downloads the file then links the bill, and DROPS any bill without an
+ * associated file — hence the mandatory relevé. A versement with no relevé at
+ * all within the window is skipped; it will be linked on a later sync once a
+ * relevé is published (the dedup key is date+amount+vendor, so re-running is
+ * safe and only re-points `invoice`).
  *
  * The file part of each bill reuses the EXACT file entry (same vendorRef /
  * filename / fileurl) produced by buildFiles, so the file dedup merges the
@@ -6407,25 +6481,25 @@ function parseReimbursements(santeFull) {
  * @returns {Array<object>} bill entries for saveBills
  */
 function buildRefundBills(reimbursements, documents, fileEntries) {
-  // First relevé PDF of each month (there is ~1 per month).
-  const monthToIndex = new Map()
-  documents.forEach((doc, index) => {
-    if (!doc.date) return
-    const key = monthKey(doc.date)
-    if (!monthToIndex.has(key)) monthToIndex.set(key, index)
-  })
+  // Relevés that carry a publication date, oldest first.
+  const dated = documents
+    .map((doc, index) => ({ index, date: doc.date }))
+    .filter(d => d.date)
+    .sort((a, b) => a.date - b.date)
 
   const bills = []
   for (const r of reimbursements) {
-    const index = monthToIndex.get(monthKey(r.date))
+    const index = pickReleveIndex(dated, r.date)
     if (index === undefined) continue // no relevé to attach → cannot save a bill
     const file = fileEntries[index]
     bills.push({
       ...file, // vendorRef, filename, fileurl, fileAttributes
-      // 'health_costs' makes cozy-banks treat this as a health bill so its
-      // byCategory filter keeps the (health-categorized) reimbursement credit;
-      // without it the pair is rejected. Same value ameli uses.
-      type: 'health_costs',
+      // Makes cozy-banks treat this as a health bill (byCategory: a health bill
+      // only matches a health transaction). Confirmed working: the bill appears
+      // on the Gan reimbursement credit. What is still missing to ALSO mark the
+      // care expense (the doctor's debit) as reimbursed is originalAmount — the
+      // fees actually paid to the professional, which Gan does not expose yet.
+      type: BILL_TYPE,
       // montantDuVersement is already the amount of the whole payment (the bank
       // credit), so `amount` matches the transaction directly — no groupAmount
       // needed (ameli needs it only because it works act-by-act).
@@ -6436,7 +6510,21 @@ function buildRefundBills(reimbursements, documents, fileEntries) {
       currency: 'EUR',
       // Drives cozy-banks matching directly (highest-priority criterion), so it
       // does not fall back to the vendor name "Gan Assurances" — which would
-      // never match a "GROUPAMA GAN VIE" transaction label.
+      // never match a "GROUPAMA GAN VIE" transaction label. Proven in production:
+      // the credit is matched, and the `\bGan Assurances\b` fallback could not
+      // possibly have matched it.
+      //
+      // ⚠️ Whoever adds `originalAmount`/`originalDate` here MUST add a wide
+      // `dateUpperDelta` in the same commit. matchFromBills.js builds the SINGLE
+      // transaction query window from getDateRangeFromBill(bill) *without* the
+      // credit flag, i.e. centred on `originalDate || date`. With
+      // originalDate = dateDuSoin, a reimbursement paid more than 29 days after
+      // the care (routine: the mutuelle pays after the CPAM) falls outside the
+      // fetched transactions, and the credit link that works today disappears
+      // silently. Size the delta on the "care → payment delay" logged at each
+      // sync (careToPaymentDelays). Note the deltas apply to BOTH searches, so
+      // the debit window widens too — the exact amount (originalAmount ± 0.001)
+      // and the 400610 category remain the real guardrails.
       matchingCriterias: { labelRegex: GAN_LABEL_REGEX }
     })
   }
@@ -7088,11 +7176,44 @@ class GanContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED_M
       const firstDoc =
         docsPayload?.hubs?.[0]?.contrats?.[0]?.documents?.[0] || null
       const firstRemb = fullPayload?.remboursementsRecents?.[0] || null
-      this.log('info', `🔬 DOC0 → ${JSON.stringify((0,_parsing__WEBPACK_IMPORTED_MODULE_4__.describeShape)(firstDoc, 8))}`)
+      this.log(
+        'info',
+        `🔬 DOC0 → ${JSON.stringify((0,_parsing__WEBPACK_IMPORTED_MODULE_4__.describeShape)(firstDoc, 8))}`
+      )
       this.log(
         'info',
         `🔬 REMB0 → ${JSON.stringify((0,_parsing__WEBPACK_IMPORTED_MODULE_4__.describeShape)(firstRemb, 8))}`
       )
+
+      // Does the décompte DETAIL expose the amount actually paid to the health
+      // professional (les « frais réels ») and the care date? That is the only
+      // missing piece to also match the health expense DEBIT in Cozy Banks —
+      // i.e. to get « Remboursé » on the care line itself instead of just a
+      // receipt on the credit line (a bill needs originalAmount + originalDate
+      // for the debit search; `remboursementsRecents` has neither).
+      // `action.url` is an SPA route: open it so the page fires its own API
+      // calls, then dump their shapes.
+      const detailUrl = firstRemb?.action?.url
+      if (detailUrl) {
+        // Ids are masked: the route carries contract/décompte numbers.
+        this.log(
+          'info',
+          `🔬 opening décompte detail ${String(detailUrl).replace(
+            /\d+/g,
+            '<id>'
+          )}`
+        )
+        try {
+          await this.goto(BASE_URL + detailUrl)
+          await this.waitForElementInWorker('body', {})
+          await this.wait(6000)
+          await this.dumpApiShapes()
+        } catch (err) {
+          this.log('warn', `🔬 décompte detail: ${err.message}`)
+        }
+      } else {
+        this.log('info', '🔬 no action.url on the most recent reimbursement')
+      }
       return
     }
 
@@ -7127,6 +7248,15 @@ class GanContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED_M
       'info',
       `${reimbursements.length} recent reimbursement(s), ${bills.length} linkable to a relevé`
     )
+
+    // Days between the care and the payment — days only, no amount, no name.
+    // This is the figure that will size matchingCriterias.dateUpperDelta if
+    // originalDate is ever set (see the warning in parsing.js/buildRefundBills);
+    // logging it at every sync builds the real distribution over time.
+    const delays = (0,_parsing__WEBPACK_IMPORTED_MODULE_4__.careToPaymentDelays)(reimbursements)
+    if (delays.length) {
+      this.log('info', `care → payment delay (days): ${delays.join(', ')}`)
+    }
 
     // Save the reimbursements as bills (this also saves+links their relevé PDF).
     if (bills.length) {
