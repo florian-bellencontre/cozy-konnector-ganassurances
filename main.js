@@ -6137,14 +6137,18 @@ microee__WEBPACK_IMPORTED_MODULE_0___default().mixin(RequestInterceptor)
 __webpack_require__.r(__webpack_exports__);
 /* harmony export */ __webpack_require__.d(__webpack_exports__, {
 /* harmony export */   BILL_TYPE: () => (/* binding */ BILL_TYPE),
+/* harmony export */   DETAIL_DATE_UPPER_DELTA: () => (/* binding */ DETAIL_DATE_UPPER_DELTA),
 /* harmony export */   DOC_DOWNLOAD_BASE: () => (/* binding */ DOC_DOWNLOAD_BASE),
 /* harmony export */   GAN_LABEL_REGEX: () => (/* binding */ GAN_LABEL_REGEX),
 /* harmony export */   buildFiles: () => (/* binding */ buildFiles),
 /* harmony export */   buildRefundBills: () => (/* binding */ buildRefundBills),
 /* harmony export */   careToPaymentDelays: () => (/* binding */ careToPaymentDelays),
+/* harmony export */   collectAmounts: () => (/* binding */ collectAmounts),
 /* harmony export */   collectRoutes: () => (/* binding */ collectRoutes),
 /* harmony export */   dateFromId: () => (/* binding */ dateFromId),
 /* harmony export */   describeShape: () => (/* binding */ describeShape),
+/* harmony export */   detailPath: () => (/* binding */ detailPath),
+/* harmony export */   enrichWithDetail: () => (/* binding */ enrichWithDetail),
 /* harmony export */   idFromActionUrl: () => (/* binding */ idFromActionUrl),
 /* harmony export */   maskIds: () => (/* binding */ maskIds),
 /* harmony export */   mergeReimbursements: () => (/* binding */ mergeReimbursements),
@@ -6153,6 +6157,7 @@ __webpack_require__.r(__webpack_exports__);
 /* harmony export */   parseDocuments: () => (/* binding */ parseDocuments),
 /* harmony export */   parseFrDate: () => (/* binding */ parseFrDate),
 /* harmony export */   parseHistoryReimbursements: () => (/* binding */ parseHistoryReimbursements),
+/* harmony export */   parseReimbursementDetail: () => (/* binding */ parseReimbursementDetail),
 /* harmony export */   parseReimbursements: () => (/* binding */ parseReimbursements),
 /* harmony export */   shortHash: () => (/* binding */ shortHash),
 /* harmony export */   summarizeJson: () => (/* binding */ summarizeJson)
@@ -6572,6 +6577,151 @@ function parseHistoryReimbursements(payload) {
 }
 
 /**
+ * Path of the décompte detail — the screen that shows « Total 30,00 € » next to
+ * « Gan 9,00 € », « Assurance maladie 21,00 € » and « Reste à charge ». The id
+ * goes in the path, the contract in the query string.
+ *
+ * @param {string} id - décompte id ("10013667701-20260730")
+ * @param {string} contractId
+ * @returns {string}
+ */
+function detailPath(id, contractId) {
+  return (
+    '/api/ecli/bff/v1/remboursement/page-detail-remboursement/' +
+    `${encodeURIComponent(id)}?idContrat=${encodeURIComponent(contractId)}`
+  )
+}
+
+/** A value that really is an amount: a number, or "9,00 €" / "1 234,56 €". */
+function looksLikeAmount(value) {
+  if (typeof value === 'number') return Number.isFinite(value)
+  if (typeof value !== 'string') return false
+  return /\d/.test(value) && /(€|\d,\d{2})/.test(value)
+}
+
+/**
+ * Every amount in a payload, with the key that carried it. Used to locate the
+ * fees without hard-coding a payload shape we have not seen yet.
+ *
+ * @param {*} value
+ * @param {string} [key]
+ * @param {Array<{key:string, amount:number}>} [out]
+ * @returns {Array<{key:string, amount:number}>}
+ */
+function collectAmounts(value, key = '', out = []) {
+  if (value === null || value === undefined) return out
+  if (Array.isArray(value)) {
+    for (const item of value) collectAmounts(item, key, out)
+    return out
+  }
+  if (typeof value === 'object') {
+    for (const k of Object.keys(value)) collectAmounts(value[k], k, out)
+    return out
+  }
+  if (looksLikeAmount(value)) {
+    const amount = parseAmount(value)
+    if (Number.isFinite(amount)) out.push({ key, amount })
+  }
+  return out
+}
+
+// Key names that carry the fees actually charged by the professional, most
+// specific first. The displayed label is « Total », so a plain `total` /
+// `montantTotal` is the likeliest — but the real key names are unknown until a
+// run logs them, hence the pattern list plus the shape log in index.js.
+const FEE_KEY_PATTERNS = [
+  /^montantTotal$/i,
+  /^total$/i,
+  /fraisReels|montantDesFrais|montantFrais/i,
+  /frais/i,
+  /depense|dépense|montantEngage/i
+]
+
+// Key names that carry the care date.
+const CARE_DATE_KEY_PATTERN = /^date(Du)?Soins?$/i
+
+/**
+ * Read the fees and the care date out of a décompte detail payload.
+ *
+ * `fees` is the « Total » of the décompte, i.e. what was paid to the health
+ * professional: that is `originalAmount`, the value cozy-banks needs to match
+ * the health expense DEBIT. It is looked up by key-name priority and returned as
+ * NaN when nothing matches — deliberately, so a bill is built WITHOUT
+ * originalAmount rather than with a wrong one (a wrong value would attach the
+ * receipt to an unrelated expense and mark it reimbursed).
+ *
+ * @param {*} payload
+ * @returns {{fees:number, careDate:(Date|null)}}
+ */
+function parseReimbursementDetail(payload) {
+  if (!payload || typeof payload !== 'object')
+    return { fees: NaN, careDate: null }
+
+  const amounts = collectAmounts(payload)
+  let fees = NaN
+  for (const pattern of FEE_KEY_PATTERNS) {
+    const matching = amounts.filter(a => pattern.test(a.key))
+    if (matching.length) {
+      // Several matches (per-acte breakdown): the décompte total is the largest.
+      fees = Math.max(...matching.map(a => a.amount))
+      break
+    }
+  }
+
+  let careDate = null
+  const walk = (value, key) => {
+    if (careDate || value === null || value === undefined) return
+    if (Array.isArray(value)) {
+      for (const item of value) walk(item, key)
+      return
+    }
+    if (typeof value === 'object') {
+      for (const k of Object.keys(value)) walk(value[k], k)
+      return
+    }
+    if (CARE_DATE_KEY_PATTERN.test(key)) careDate = parseFrDate(value)
+  }
+  walk(payload, '')
+
+  return { fees, careDate }
+}
+
+/**
+ * Widen the DEBIT/CREDIT date window when originalDate is set. Mandatory: the
+ * single transaction query window of matchFromBills.js is centred on
+ * `originalDate || date`, so a versement paid long after the care would fall
+ * outside the fetched transactions and the credit link that works today would
+ * silently break. Sized well above the observed care → payment delays, which the
+ * konnector logs at every sync.
+ */
+const DETAIL_DATE_UPPER_DELTA = 90
+
+/**
+ * Attach the detail data to a reimbursement, but only when it is coherent: the
+ * fees must cover the reimbursed part (Gan never pays more than the bill) and
+ * stay in a sane range. An incoherent detail is ignored, leaving the
+ * reimbursement matchable on its credit alone.
+ *
+ * @param {object} reimbursement - {amount, date, careDate…}
+ * @param {{fees:number, careDate:(Date|null)}} detail
+ * @returns {object} a new reimbursement
+ */
+function enrichWithDetail(reimbursement, detail) {
+  const enriched = { ...reimbursement }
+  if (detail?.careDate && !enriched.careDate)
+    enriched.careDate = detail.careDate
+
+  const fees = detail?.fees
+  const coherent =
+    Number.isFinite(fees) &&
+    fees > 0 &&
+    fees >= enriched.amount - 0.001 &&
+    fees <= enriched.amount * 50
+  if (coherent) enriched.fees = fees
+  return enriched
+}
+
+/**
  * Merge the full history with the dashboard's recent list, keyed on the décompte
  * id (falling back to date+amount). The history is exhaustive but has no care
  * date; the recent list has `dateDuSoin`. Merging keeps the best of both.
@@ -6706,6 +6856,18 @@ function buildRefundBills(reimbursements, documents, fileEntries) {
       vendor: 'Gan Assurances',
       isRefund: true,
       currency: 'EUR',
+      // With the décompte fees AND the care date, the bill can also match the
+      // health expense DEBIT — which is what writes operation.reimbursements and
+      // turns the care line into « Remboursé » with the receipt attached. Both
+      // are required: originalAmount alone would search the debit around the
+      // payment date, originalDate alone would search for the reimbursed amount
+      // instead of the fees. Neither is set unless the detail was coherent.
+      ...(Number.isFinite(r.fees) && r.careDate
+        ? {
+            originalAmount: r.fees,
+            originalDate: r.careDate
+          }
+        : {}),
       // Drives cozy-banks matching directly (highest-priority criterion), so it
       // does not fall back to the vendor name "Gan Assurances" — which would
       // never match a "GROUPAMA GAN VIE" transaction label. Proven in production:
@@ -6723,7 +6885,12 @@ function buildRefundBills(reimbursements, documents, fileEntries) {
       // sync (careToPaymentDelays). Note the deltas apply to BOTH searches, so
       // the debit window widens too — the exact amount (originalAmount ± 0.001)
       // and the 400610 category remain the real guardrails.
-      matchingCriterias: { labelRegex: GAN_LABEL_REGEX }
+      matchingCriterias: {
+        labelRegex: GAN_LABEL_REGEX,
+        ...(Number.isFinite(r.fees) && r.careDate
+          ? { dateUpperDelta: DETAIL_DATE_UPPER_DELTA }
+          : {})
+      }
     })
   }
   return bills
@@ -6903,12 +7070,19 @@ const AUTH_HOST = 'authentification.ganassurances.fr'
 //   by month, with `montant` and `dateVersement` but no care date and no fees.
 // - relevé documents carry no amount in their metadata ({identifiant, libelle,
 //   codeType, isNew, datePublication}) — only inside the PDF itself.
-// - the fees ("Total 30,00 €" next to "Gan 9,00 €" on the détail screen) are the
-//   last missing piece, and its endpoint is STILL unknown: five candidate paths
-//   under v1/remboursement/ answer 404, and the `/front/` pages do not boot in
-//   the konnector webview (0 XHR, empty DOM), so no interception is possible.
-//   The remaining lead is the site's own JS bundle, only readable authenticated.
+// - v1/remboursement/page-detail-remboursement/{id}?idContrat={contrat} → ONE
+//   décompte, with the fees ("Total 30,00 €" next to "Gan 9,00 €" and
+//   "Assurance maladie 21,00 €") and the care date. Id in the path, contract in
+//   the query string — which is why the earlier `{contrat}/{id}` guesses 404'd.
+// - the `/front/` pages do NOT boot in the konnector webview (0 XHR, empty DOM),
+//   so nothing can be scraped or intercepted there: everything must go through
+//   these API endpoints.
 const DISCOVERY_MODE = false
+
+// Max décompte details fetched per run (one API call each). The history grows
+// over time, so this bounds a sync instead of hammering the API; what is left out
+// is logged and picked up by the next run.
+const MAX_DETAIL_CALLS = 40
 
 // Endpoints we intercept (JSON bodies). Confirmed by recon:
 // - sante-prevoyance/full → contract id (contratsSante[0].identifiant)
@@ -7567,7 +7741,53 @@ class GanContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED_M
     }
 
     // History is exhaustive but carries no care date; the recent list carries it.
-    const reimbursements = (0,_parsing__WEBPACK_IMPORTED_MODULE_4__.mergeReimbursements)(history, recent)
+    let reimbursements = (0,_parsing__WEBPACK_IMPORTED_MODULE_4__.mergeReimbursements)(history, recent)
+
+    // Each décompte detail carries the FEES (the « Total » shown next to the Gan
+    // part) and the care date — `originalAmount` + `originalDate`, i.e. what lets
+    // cozy-banks match the health expense itself and not only the reimbursement
+    // credit. One call per décompte, so the number is capped and any truncation
+    // is logged rather than silent.
+    if (contractId && reimbursements.length) {
+      const withId = reimbursements.filter(r => r.id)
+      const budget = withId.slice(0, MAX_DETAIL_CALLS)
+      if (withId.length > budget.length) {
+        this.log(
+          'info',
+          `detail: ${
+            withId.length - budget.length
+          } reimbursement(s) left without fees this run (cap ${MAX_DETAIL_CALLS}), they will be enriched on a later sync`
+        )
+      }
+      const details = new Map()
+      let shapeLogged = false
+      for (const r of budget) {
+        const payload = await this.runInWorker(
+          'apiGet',
+          (0,_parsing__WEBPACK_IMPORTED_MODULE_4__.detailPath)(r.id, contractId)
+        )
+        if (!shapeLogged && payload && typeof payload === 'object') {
+          // Key names + types only, never a value: this is what tells us the real
+          // field names if the fee lookup below ever stops matching.
+          this.log(
+            'info',
+            `détail shape → ${JSON.stringify((0,_parsing__WEBPACK_IMPORTED_MODULE_4__.describeShape)(payload, 6))}`
+          )
+          shapeLogged = true
+        }
+        details.set(r.id, (0,_parsing__WEBPACK_IMPORTED_MODULE_4__.parseReimbursementDetail)(payload))
+      }
+      reimbursements = reimbursements.map(r =>
+        details.has(r.id) ? (0,_parsing__WEBPACK_IMPORTED_MODULE_4__.enrichWithDetail)(r, details.get(r.id)) : r
+      )
+      const withFees = reimbursements.filter(r =>
+        Number.isFinite(r.fees)
+      ).length
+      this.log(
+        'info',
+        `detail: fees found for ${withFees}/${budget.length} décompte(s)`
+      )
+    }
     // Destinataire TYPES only (enum codes, no name): a versement paid to the
     // professional is tiers payant, never lands on the bank account, and should
     // eventually be flagged isThirdPartyPayer instead of being left unmatchable.
