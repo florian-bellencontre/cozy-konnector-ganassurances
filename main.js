@@ -6150,6 +6150,7 @@ __webpack_require__.r(__webpack_exports__);
 /* harmony export */   detailPath: () => (/* binding */ detailPath),
 /* harmony export */   enrichWithDetail: () => (/* binding */ enrichWithDetail),
 /* harmony export */   idFromActionUrl: () => (/* binding */ idFromActionUrl),
+/* harmony export */   isThirdPartyPayer: () => (/* binding */ isThirdPartyPayer),
 /* harmony export */   maskIds: () => (/* binding */ maskIds),
 /* harmony export */   mergeReimbursements: () => (/* binding */ mergeReimbursements),
 /* harmony export */   monthKey: () => (/* binding */ monthKey),
@@ -6689,12 +6690,39 @@ function parseReimbursementDetail(payload) {
 /**
  * Widen the DEBIT/CREDIT date window when originalDate is set. Mandatory: the
  * single transaction query window of matchFromBills.js is centred on
- * `originalDate || date`, so a versement paid long after the care would fall
- * outside the fetched transactions and the credit link that works today would
- * silently break. Sized well above the observed care → payment delays, which the
- * konnector logs at every sync.
+ * `originalDate || date`, so a versement paid after the care would fall outside
+ * the fetched transactions and the credit link that works today would silently
+ * break.
+ *
+ * Sized on real data: the konnector logs the care → payment delay at every sync
+ * and the measured values are 5, 6 and 7 days. 45 days leaves a wide margin for a
+ * slow reimbursement (paper claim, CPAM processed first) while keeping the debit
+ * window tight — every extra day widens the search for a same-amount health
+ * expense, and the exact amount is the last guardrail.
  */
-const DETAIL_DATE_UPPER_DELTA = 90
+const DETAIL_DATE_UPPER_DELTA = 45
+
+/**
+ * Was the versement paid to the insured, or to a third party (the professional,
+ * i.e. tiers payant)? Gan labels this in plain French — observed values are
+ * « l'assuré » and « un tiers ».
+ *
+ * A tiers payant versement never lands on the bank account, so its bill can
+ * never be matched; flagging it keeps the Linker from even trying
+ * (`bills.filter(bill => !bill.isThirdPartyPayer === true)`) while the document
+ * still lands in Drive.
+ *
+ * @param {*} destType
+ * @returns {boolean|undefined} undefined when the label is unknown — better no
+ *   flag than a wrong one, which would silently drop a matchable versement
+ */
+function isThirdPartyPayer(destType) {
+  if (!destType) return undefined
+  const label = String(destType).toLowerCase()
+  if (/assur/.test(label)) return false
+  if (/tiers|professionnel|praticien/.test(label)) return true
+  return undefined
+}
 
 /**
  * Attach the detail data to a reimbursement, but only when it is coherent: the
@@ -6856,6 +6884,12 @@ function buildRefundBills(reimbursements, documents, fileEntries) {
       vendor: 'Gan Assurances',
       isRefund: true,
       currency: 'EUR',
+      // Tiers payant: paid to the professional, so no bank credit exists and the
+      // Linker must skip the bill instead of hunting for a transaction that
+      // cannot be there. Only set when the label is unambiguous.
+      ...(isThirdPartyPayer(r.destType) === true
+        ? { isThirdPartyPayer: true }
+        : {}),
       // With the décompte fees AND the care date, the bill can also match the
       // health expense DEBIT — which is what writes operation.reimbursements and
       // turns the care line into « Remboursé » with the receipt attached. Both
@@ -7732,12 +7766,23 @@ class GanContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED_M
         `/api/ecli/bff/v1/remboursement/page-remboursements/${contractId}`
       )
       history = (0,_parsing__WEBPACK_IMPORTED_MODULE_4__.parseHistoryReimbursements)(payload)
+      const bloc = payload?.blocRemboursements
       this.log(
         'info',
         `history: ${history.length} reimbursement(s) over ${
-          payload?.blocRemboursements?.remboursementsParMois?.length || 0
-        } month(s), paginationWeb=${payload?.blocRemboursements?.paginationWeb}`
+          bloc?.remboursementsParMois?.length || 0
+        } month(s), paginationWeb=${bloc?.paginationWeb}`
       )
+      // Measured: 14 items over 6 months for a paginationWeb of 15 — this default
+      // page is NOT the whole history (versements exist back to 2021). The page
+      // exposes filters; logging their names (labels, no personal data) is what
+      // will tell us how to ask for an older period.
+      const filters = (bloc?.filtresRemboursements || [])
+        .map(f => f?.typeFiltre)
+        .filter(Boolean)
+      if (filters.length) {
+        this.log('info', `history filters available: ${filters.join(', ')}`)
+      }
     }
 
     // History is exhaustive but carries no care date; the recent list carries it.
