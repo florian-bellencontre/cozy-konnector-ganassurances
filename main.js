@@ -7275,7 +7275,7 @@ const DISCOVERY_MODE = false
 //   2. write decompteId on the stored bills with a one-shot _bulk_docs;
 //   3. flip to `true` and run again — the missing versement is created, the
 //      others are recognised.
-const DEDUP_ON_DECOMPTE_ID = false
+const DEDUP_ON_DECOMPTE_ID = true
 
 // Max décompte details fetched per run (one API call each). The history grows
 // over time, so this bounds a sync instead of hammering the API; what is left out
