@@ -8071,6 +8071,23 @@ class GanContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED_M
         )
       }
 
+      // Identity of every versement, in the most compact form possible: the
+      // stack truncates a log message around 2 kB and the `bill patch` below
+      // lost its two oldest entries that way, which is exactly what a migration
+      // must not lose (a bill left without decompteId is duplicated the day the
+      // dedup keys change).
+      this.log(
+        'info',
+        `bill ids → ${bills
+          .map(
+            b =>
+              `${b.decompteId || '?'}=${b.date.toISOString().slice(0, 10)}|${
+                b.amount
+              }`
+          )
+          .join(' ')}`
+      )
+
       // One-shot migration material: what SHOULD be stored on each bill. A LIST
       // (it used to be a map keyed by date|amount, which silently dropped one
       // entry per collision: 15 versements, 14 keys), carrying the decompteId so
