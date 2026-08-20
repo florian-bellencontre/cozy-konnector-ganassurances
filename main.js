@@ -6147,6 +6147,7 @@ __webpack_require__.r(__webpack_exports__);
 /* harmony export */   collectRoutes: () => (/* binding */ collectRoutes),
 /* harmony export */   dateFromId: () => (/* binding */ dateFromId),
 /* harmony export */   dateUpperDeltaFor: () => (/* binding */ dateUpperDeltaFor),
+/* harmony export */   dedupCollisions: () => (/* binding */ dedupCollisions),
 /* harmony export */   describeShape: () => (/* binding */ describeShape),
 /* harmony export */   detailPath: () => (/* binding */ detailPath),
 /* harmony export */   enrichWithDetail: () => (/* binding */ enrichWithDetail),
@@ -6161,6 +6162,7 @@ __webpack_require__.r(__webpack_exports__);
 /* harmony export */   parseHistoryReimbursements: () => (/* binding */ parseHistoryReimbursements),
 /* harmony export */   parseReimbursementDetail: () => (/* binding */ parseReimbursementDetail),
 /* harmony export */   parseReimbursements: () => (/* binding */ parseReimbursements),
+/* harmony export */   paymentGroups: () => (/* binding */ paymentGroups),
 /* harmony export */   roundCents: () => (/* binding */ roundCents),
 /* harmony export */   shortHash: () => (/* binding */ shortHash),
 /* harmony export */   summarizeJson: () => (/* binding */ summarizeJson)
@@ -6907,6 +6909,41 @@ function pickReleveIndex(dated, date) {
 }
 
 /**
+ * Total actually transferred per payment date, and how many décomptes it covers.
+ *
+ * Gan pays several décomptes in ONE bank transfer: two 70,00 € décomptes paid on
+ * 2026-06-17 arrive as a single +140,00 € credit. The bank therefore holds no
+ * transaction of 70,00 €, and `byAmounts` — which compares
+ * `bill.groupAmount || bill.amount` to the credit — can only match if each bill
+ * of the group carries the total. Hence groupAmount, the same way the ameli
+ * konnector uses it act by act.
+ *
+ * Tiers payant décomptes are left out of the sum: they are paid to the
+ * professional, so they are not part of any transfer to the insured.
+ *
+ * @param {Array<{amount:number, date:Date, destType:(string|null)}>} reimbursements
+ * @returns {Map<string, {count:number, total:number}>} keyed by ISO day
+ */
+/** How many décomptes share this reimbursement's payment date. */
+function groupOf(groups, r) {
+  const group = groups.get(r.date.toISOString().slice(0, 10))
+  return group ? group.count : 1
+}
+
+function paymentGroups(reimbursements) {
+  const groups = new Map()
+  for (const r of reimbursements) {
+    if (isThirdPartyPayer(r.destType) === true) continue
+    const key = r.date.toISOString().slice(0, 10)
+    const group = groups.get(key) || { count: 0, total: 0 }
+    group.count += 1
+    group.total = roundCents(group.total + r.amount)
+    groups.set(key, group)
+  }
+  return groups
+}
+
+/**
  * Build `io.cozy.bills` entries for the reimbursements, each linked to the
  * closest monthly relevé PDF (see pickReleveIndex). cozy-clisk's saveBills
  * downloads the file then links the bill, and DROPS any bill without an
@@ -6933,11 +6970,18 @@ function buildRefundBills(reimbursements, documents, fileEntries) {
     .filter(d => d.date)
     .sort((a, b) => a.date - b.date)
 
+  // Computed over ALL the reimbursements, not just the ones that end up as a
+  // bill: a décompte skipped for lack of a relevé is still part of the transfer.
+  const groups = paymentGroups(reimbursements)
+
   const bills = []
   for (const r of reimbursements) {
     const index = pickReleveIndex(dated, r.date)
     if (index === undefined) continue // no relevé to attach → cannot save a bill
     const file = fileEntries[index]
+    // Paid to the professional: outside every transfer to the insured, so it
+    // must neither count in a group nor claim a grouped credit.
+    const thirdParty = isThirdPartyPayer(r.destType) === true
     bills.push({
       ...file, // vendorRef, filename, fileurl, fileAttributes
       // Makes cozy-banks treat this as a health bill (byCategory: a health bill
@@ -6954,12 +6998,27 @@ function buildRefundBills(reimbursements, documents, fileEntries) {
       vendor: 'Gan Assurances',
       isRefund: true,
       currency: 'EUR',
+      // Identity of the décompte — the ONLY thing that separates two versements
+      // paid the same day for the same amount. Observed in production on
+      // 2026-06-17: two 70,00 € décomptes, one for care of 2026-06-05, one for
+      // care of 2026-03-16 (a 93-day-late reimbursement). saveBills dedups on
+      // ['date','amount','vendor'], so that pair collapses into ONE bill:
+      // hydrateAndFilter's store is keyed by that hash, hands both entries the
+      // same `_id`, and its final uniqBy drops one. Listing this field in
+      // `options.keys` separates them — and `keys` being an array it survives
+      // the pilot→launcher JSON bridge, unlike a `shouldUpdate` function.
+      ...(r.id ? { decompteId: r.id } : {}),
+      // Amount of the whole transfer when it covers several décomptes — what
+      // the bank credit really shows (see paymentGroups). Never set for a lone
+      // décompte: `amount` is then the transfer itself, and a groupAmount equal
+      // to it would only add noise.
+      ...(!thirdParty && groupOf(groups, r) > 1
+        ? { groupAmount: groups.get(r.date.toISOString().slice(0, 10)).total }
+        : {}),
       // Tiers payant: paid to the professional, so no bank credit exists and the
       // Linker must skip the bill instead of hunting for a transaction that
       // cannot be there. Only set when the label is unambiguous.
-      ...(isThirdPartyPayer(r.destType) === true
-        ? { isThirdPartyPayer: true }
-        : {}),
+      ...(thirdParty ? { isThirdPartyPayer: true } : {}),
       // With the décompte fees AND the care date, the bill can also match the
       // health expense DEBIT — which is what writes operation.reimbursements and
       // turns the care line into « Remboursé » with the receipt attached. Both
@@ -6998,6 +7057,28 @@ function buildRefundBills(reimbursements, documents, fileEntries) {
     })
   }
   return bills
+}
+
+/**
+ * Bills that saveBills cannot tell apart, i.e. that share its deduplication key
+ * (date + amount, the vendor being constant here). One entry per colliding
+ * group, so a sync can say out loud that N versements map to a single stored
+ * bill — the symptom being a reimbursement that is never created, or created
+ * once and never updated again.
+ *
+ * @param {Array<object>} bills - bills from buildRefundBills
+ * @returns {Array<{date:string, amount:number, ids:Array<string>}>}
+ */
+function dedupCollisions(bills) {
+  const groups = new Map()
+  for (const bill of bills) {
+    const date = bill.date.toISOString().slice(0, 10)
+    const key = `${date}|${bill.amount}`
+    if (!groups.has(key))
+      groups.set(key, { date, amount: bill.amount, ids: [] })
+    groups.get(key).ids.push(bill.decompteId || '?')
+  }
+  return [...groups.values()].filter(g => g.ids.length > 1)
 }
 
 /**
@@ -7182,6 +7263,19 @@ const AUTH_HOST = 'authentification.ganassurances.fr'
 //   so nothing can be scraped or intercepted there: everything must go through
 //   these API endpoints.
 const DISCOVERY_MODE = false
+
+// Deduplication of io.cozy.bills. saveBills' default key is
+// date+amount+vendor, which cannot separate two décomptes paid the same day for
+// the same amount (see dedupCollisions and the `decompteId` comment in
+// parsing.js): one of the two is never stored, or stored once and never updated.
+// Adding `decompteId` to the keys fixes it, but ONLY once every bill already
+// stored carries that field — otherwise every existing bill hashes differently,
+// looks new, and gets duplicated. Order of operations:
+//   1. run with `false`, read the `bill patch →` log (it now carries decompteId);
+//   2. write decompteId on the stored bills with a one-shot _bulk_docs;
+//   3. flip to `true` and run again — the missing versement is created, the
+//      others are recognised.
+const DEDUP_ON_DECOMPTE_ID = false
 
 // Max décompte details fetched per run (one API call each). The history grows
 // over time, so this bounds a sync instead of hammering the API; what is left out
@@ -7934,7 +8028,13 @@ class GanContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED_M
         context,
         fileIdAttributes: ['vendorRef'],
         contentType: 'application/pdf',
-        qualificationLabel: 'health_invoice'
+        qualificationLabel: 'health_invoice',
+        // Unlike a function, an array crosses the bridge intact — this is the
+        // only way to change how bills are deduplicated. See
+        // DEDUP_ON_DECOMPTE_ID before flipping it.
+        ...(DEDUP_ON_DECOMPTE_ID
+          ? { keys: ['date', 'amount', 'vendor', 'decompteId'] }
+          : {})
         // No `shouldUpdate` here, and it is NOT an omission: options cross the
         // pilot→launcher bridge through JSON.stringify
         // (ContentScriptMessenger.postMessage), so a function property is
@@ -7946,21 +8046,52 @@ class GanContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED_M
         // already stored need the one-shot patch built from the log below.
       })
 
-      // One-shot migration material: what SHOULD be stored on each bill, keyed by
-      // date|amount so an existing document can be patched server-side. Logged
-      // only for the bills that carry fees, and only until they all do.
-      const patch = {}
-      for (const bill of bills) {
-        if (!Number.isFinite(bill.originalAmount) || !bill.originalDate)
-          continue
-        const key = `${bill.date.toISOString().slice(0, 10)}|${bill.amount}`
-        patch[key] = {
-          originalAmount: bill.originalAmount,
-          originalDate: bill.originalDate.toISOString().slice(0, 10),
-          dateUpperDelta: bill.matchingCriterias.dateUpperDelta
+      // Transfers covering several décomptes: the bank shows their TOTAL, so
+      // each bill of the group carries it as groupAmount. Logged (day, count,
+      // total) because it is the figure to compare with the bank statement the
+      // day a grouped reimbursement does not match.
+      for (const [day, group] of (0,_parsing__WEBPACK_IMPORTED_MODULE_4__.paymentGroups)(reimbursements)) {
+        if (group.count > 1) {
+          this.log(
+            'info',
+            `grouped transfer → ${day}: ${group.count} décompte(s), ${group.total} €`
+          )
         }
       }
-      if (Object.keys(patch).length) {
+
+      // Versements that saveBills cannot tell apart. Logged loudly because the
+      // consequence is silent: one bill for two décomptes, hence one bank credit
+      // that can never be matched.
+      for (const c of (0,_parsing__WEBPACK_IMPORTED_MODULE_4__.dedupCollisions)(bills)) {
+        this.log(
+          'info',
+          `dedup collision → ${c.date} / ${c.amount} € shared by ${
+            c.ids.length
+          } décompte(s): ${c.ids.join(', ')}`
+        )
+      }
+
+      // One-shot migration material: what SHOULD be stored on each bill. A LIST
+      // (it used to be a map keyed by date|amount, which silently dropped one
+      // entry per collision: 15 versements, 14 keys), carrying the decompteId so
+      // a _bulk_docs can both identify the stored document by date+amount and
+      // write the id that will keep the pair apart from now on.
+      const patch = bills.map(bill => ({
+        decompteId: bill.decompteId || null,
+        date: bill.date.toISOString().slice(0, 10),
+        amount: bill.amount,
+        ...(Number.isFinite(bill.groupAmount)
+          ? { groupAmount: bill.groupAmount }
+          : {}),
+        ...(Number.isFinite(bill.originalAmount) && bill.originalDate
+          ? {
+              originalAmount: bill.originalAmount,
+              originalDate: bill.originalDate.toISOString().slice(0, 10),
+              dateUpperDelta: bill.matchingCriterias.dateUpperDelta
+            }
+          : {})
+      }))
+      if (patch.length) {
         this.log('info', `bill patch → ${JSON.stringify(patch)}`)
       }
     }
